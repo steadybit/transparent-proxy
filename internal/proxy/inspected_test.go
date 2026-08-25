@@ -118,7 +118,8 @@ func TestServer_InspectedPath_SNIMatchAborts(t *testing.T) {
 	defer conn.Close()
 
 	if _, err := conn.Write(hello); err != nil {
-		t.Fatalf("write hello: %v", err)
+		// A reset racing the write is also a valid abort outcome.
+		return
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
