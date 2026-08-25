@@ -85,6 +85,32 @@ func TestMatch_AbortProbabilityExtremes(t *testing.T) {
 	}
 }
 
+func TestInspectSNI(t *testing.T) {
+	// A host rule with no CIDR constraint => inspect every destination.
+	anyHost := NewEngine([]Rule{{Name: "h", Hosts: []string{"x.com"}}})
+	if !anyHost.InspectSNI(addrPort(t, "9.9.9.9:443")) {
+		t.Fatal("unconstrained host rule should inspect any destination")
+	}
+
+	// A host rule scoped to a CIDR => inspect only inside that CIDR.
+	scoped := NewEngine([]Rule{{Name: "h", Hosts: []string{"b.com"}, CIDRs: []netip.Prefix{mustPrefix(t, "1.2.3.0/24")}}})
+	if !scoped.InspectSNI(addrPort(t, "1.2.3.4:443")) {
+		t.Fatal("scoped host rule should inspect destinations inside its CIDR")
+	}
+	if scoped.InspectSNI(addrPort(t, "9.9.9.9:443")) {
+		t.Fatal("scoped host rule should not inspect destinations outside its CIDR")
+	}
+
+	// CIDR-only rules never need SNI.
+	if NewEngine([]Rule{{Name: "c", CIDRs: []netip.Prefix{mustPrefix(t, "10.0.0.0/8")}}}).InspectSNI(addrPort(t, "10.0.0.1:443")) {
+		t.Fatal("cidr-only rule should not trigger inspection")
+	}
+
+	if NewEngine(nil).InspectSNI(addrPort(t, "1.1.1.1:80")) {
+		t.Fatal("empty engine should never inspect")
+	}
+}
+
 func TestNeedsSNI(t *testing.T) {
 	if NewEngine([]Rule{{Name: "cidr", CIDRs: []netip.Prefix{mustPrefix(t, "10.0.0.0/8")}}}).NeedsSNI() {
 		t.Fatal("CIDR-only rules should not need SNI")

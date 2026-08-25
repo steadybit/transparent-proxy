@@ -37,13 +37,20 @@ func startEcho(t *testing.T) netip.AddrPort {
 // startProxy runs a Server whose ResolveDst always points at dst.
 func startProxy(t *testing.T, dst netip.AddrPort, engine *fault.Engine) netip.AddrPort {
 	t.Helper()
+	return serveProxy(t, &Server{Faults: engine}, dst)
+}
+
+// serveProxy serves s on a fresh loopback listener, defaulting ResolveDst to
+// dst, and returns the address to dial. It lets a test supply a customised
+// Server (e.g. PeekTimeout) while sharing the listen/serve boilerplate.
+func serveProxy(t *testing.T, s *Server, dst netip.AddrPort) netip.AddrPort {
+	t.Helper()
+	if s.ResolveDst == nil {
+		s.ResolveDst = func(*net.TCPConn) (netip.AddrPort, error) { return dst, nil }
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen proxy: %v", err)
-	}
-	s := &Server{
-		Faults:     engine,
-		ResolveDst: func(*net.TCPConn) (netip.AddrPort, error) { return dst, nil },
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

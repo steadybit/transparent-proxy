@@ -23,3 +23,16 @@ jobs:
         run: go test -race ./...
       - name: Build (linux amd64 + arm64)
         run: make linux
+
+  integration-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+      # Exercises the SO_ORIGINAL_DST recovery path against a real iptables
+      # REDIRECT rule (needs root + the nat table).
+      - name: SO_ORIGINAL_DST under iptables REDIRECT
+        run: sudo env "PATH=$PATH" "HOME=$HOME" go test -tags integration -run TestOriginalDst ./internal/proxy/ -v
