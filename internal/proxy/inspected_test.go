@@ -157,10 +157,11 @@ func TestServer_InspectedPath_NonMatchingSNIPassesThrough(t *testing.T) {
 	}
 }
 
-// TestServer_PeekTimeout_DropsAndSkipsUpstream proves that when SNI inspection
-// applies but the client speaks second (server-first protocol), the peek times
-// out, the connection is dropped, and upstream is never contacted.
-func TestServer_PeekTimeout_DropsAndSkipsUpstream(t *testing.T) {
+// TestServer_SniffTimeout_ForwardsFailOpen proves that when inspection applies
+// but the client speaks second (server-first protocol), the sniff times out and
+// the connection is forwarded untouched rather than dropped — the resilient,
+// fail-open behaviour (a missed fault is preferable to a broken connection).
+func TestServer_SniffTimeout_ForwardsFailOpen(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen upstream: %v", err)
@@ -184,20 +185,87 @@ func TestServer_PeekTimeout_DropsAndSkipsUpstream(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Send nothing: the peek should time out and the connection be dropped.
-	start := time.Now()
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Read(make([]byte, 1)); err == nil {
-		t.Fatal("expected connection to be dropped after the peek timeout")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("drop took %v, expected roughly the 150ms peek timeout", elapsed)
-	}
-
+	// Send nothing (server-first). After the sniff times out the proxy should
+	// forward the connection to the upstream instead of dropping it.
 	select {
 	case <-contacted:
-		t.Fatal("upstream was contacted despite the peek timing out")
+		// forwarded — the resilient outcome
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream was not contacted; connection was dropped instead of forwarded")
+	}
+}
+
+// TestServer_HTTPStatusInjection proves an L7 rule synthesizes a status
+// response by Host header without ever contacting the upstream.
+func TestServer_HTTPStatusInjection(t *testing.T) {
+	upstreamHit := make(chan struct{}, 1)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			upstreamHit <- struct{}{}
+			_ = c.Close()
+		}
+	}()
+	upstream := ln.Addr().(*net.TCPAddr).AddrPort()
+
+	engine := fault.NewEngine([]fault.Rule{{Name: "503", Hosts: []string{"api.example.com"}, HTTPStatus: 503}})
+	proxyAddr := serveProxy(t, &Server{Faults: engine}, upstream)
+
+	conn, err := net.DialTimeout("tcp", proxyAddr.String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := io.WriteString(conn, "GET /x HTTP/1.1\r\nHost: api.example.com\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if !bytes.HasPrefix(buf[:n], []byte("HTTP/1.1 503")) {
+		t.Fatalf("response = %q, want a 503 status line", buf[:n])
+	}
+	select {
+	case <-upstreamHit:
+		t.Fatal("upstream was contacted despite an injected status")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestServer_HTTPNonMatchingHostForwards proves a request whose Host matches no
+// rule is proxied through untouched.
+func TestServer_HTTPNonMatchingHostForwards(t *testing.T) {
+	echo := startEcho(t)
+	engine := fault.NewEngine([]fault.Rule{{Name: "503", Hosts: []string{"blocked.example.com"}, HTTPStatus: 503}})
+	proxyAddr := serveProxy(t, &Server{Faults: engine}, echo)
+
+	conn, err := net.DialTimeout("tcp", proxyAddr.String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	req := "GET /x HTTP/1.1\r\nHost: allowed.example.com\r\n\r\n"
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// The echo upstream returns exactly what the proxy forwarded — the original
+	// request bytes, byte-identical.
+	echoed := make([]byte, len(req))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, echoed); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(echoed) != req {
+		t.Fatalf("forwarded request altered:\n got %q\nwant %q", echoed, req)
 	}
 }
 

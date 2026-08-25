@@ -137,6 +137,40 @@ func TestE2E_PoolFlushResurrectsWarmConnection(t *testing.T) {
 	eventually(t, func() bool { return m.Snapshot().ConnectionsMatched >= 1 })
 }
 
+func TestE2E_HTTPStatusInjectionByHost(t *testing.T) {
+	var upstreamCalls int
+	var mu sync.Mutex
+	up := startHTTPUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		upstreamCalls++
+		mu.Unlock()
+		_, _ = io.WriteString(w, "real upstream")
+	})
+	m := metrics.New()
+	engine := fault.NewEngine([]fault.Rule{{Name: "down", Hosts: []string{"localhost"}, HTTPStatus: 503}})
+	px := startRealProxy(t, engine, m)
+	intercept(t, px, up, "e2e-http503")
+
+	// http.Get to localhost:<up> is redirected into the proxy, which matches the
+	// Host header ("localhost") and injects 503 without hitting the upstream.
+	resp, err := (&http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}).
+		Get(fmt.Sprintf("http://localhost:%d/", up))
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatalf("status = %d, want 503 (injected)", resp.StatusCode)
+	}
+	mu.Lock()
+	calls := upstreamCalls
+	mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("upstream was called %d times; injected status must not reach it", calls)
+	}
+}
+
 func TestE2E_NoLoopStormUnderConcurrentLoad(t *testing.T) {
 	up := startHTTPUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "ok")

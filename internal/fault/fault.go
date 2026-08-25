@@ -35,13 +35,23 @@ type Rule struct {
 	// AbortProbability in [0,1] is the chance the connection is reset
 	// (RST) instead of being proxied, simulating a refused/flaky dependency.
 	AbortProbability float64
+
+	// HTTPStatus, if non-zero, makes the proxy synthesize an HTTP response with
+	// this status code instead of forwarding — an L7 fault that applies only to
+	// cleartext HTTP (it is ignored on TLS/opaque connections). Selected by the
+	// Host header, matched with the same semantics as Hosts.
+	HTTPStatus int
 }
+
+// hasL7 reports whether the rule carries an L7-only fault.
+func (r Rule) hasL7() bool { return r.HTTPStatus != 0 }
 
 // Action is the decision for a single connection.
 type Action struct {
-	Rule    string
-	Latency time.Duration
-	Abort   bool
+	Rule       string
+	Latency    time.Duration
+	Abort      bool
+	HTTPStatus int
 }
 
 // Engine holds an ordered rule set. The first matching rule wins.
@@ -83,14 +93,31 @@ func (e *Engine) InspectSNI(dst netip.AddrPort) bool {
 	return false
 }
 
-// Match returns the Action for a connection to dst with the given SNI (empty
-// if unknown or not TLS). The zero Action means "proxy through untouched".
-func (e *Engine) Match(dst netip.AddrPort, sni string) Action {
+// Inspect reports whether the proxy should read the connection payload for dst
+// — to extract a TLS SNI or an HTTP Host header — i.e. whether any rule that
+// selects on identity (Hosts) or carries an L7 fault could match dst. When
+// false, the connection stays on the pure-splice fast path.
+func (e *Engine) Inspect(dst netip.AddrPort) bool {
+	for _, r := range e.rules {
+		if len(r.Hosts) == 0 && !r.hasL7() {
+			continue
+		}
+		if cidrsMatch(r.CIDRs, dst.Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
+// Match returns the Action for a connection to dst with the given identity
+// (a TLS SNI or an HTTP Host header; empty if unknown). The zero Action means
+// "proxy through untouched".
+func (e *Engine) Match(dst netip.AddrPort, identity string) Action {
 	for _, r := range e.rules {
 		if !cidrsMatch(r.CIDRs, dst.Addr()) {
 			continue
 		}
-		if !hostsMatch(r.Hosts, sni) {
+		if !hostsMatch(r.Hosts, identity) {
 			continue
 		}
 		return Action{
@@ -98,7 +125,8 @@ func (e *Engine) Match(dst netip.AddrPort, sni string) Action {
 			Latency: r.Latency,
 			// Top-level rand.Float64 is safe for concurrent use by the
 			// per-connection goroutines and independent across restarts.
-			Abort:   r.AbortProbability > 0 && rand.Float64() < r.AbortProbability,
+			Abort:      r.AbortProbability > 0 && rand.Float64() < r.AbortProbability,
+			HTTPStatus: r.HTTPStatus,
 		}
 	}
 	return Action{}

@@ -3,11 +3,6 @@
 
 package proxy
 
-import (
-	"io"
-	"net"
-)
-
 const (
 	tlsRecordHeaderLen   = 5
 	tlsHandshakeRecord   = 0x16
@@ -16,39 +11,6 @@ const (
 	extServerName        = 0x0000
 	sniHostNameType      = 0x00
 )
-
-// peekClientHello reads the first TLS record from c, extracts the SNI server
-// name (empty when the traffic is not a TLS ClientHello or carries no SNI),
-// and returns every byte it consumed from the socket so the caller can replay
-// them to the upstream. This is a byte-preserving peek: parsing never mutates
-// the stream, so after replaying `consumed` the remainder can be spliced raw.
-func peekClientHello(c net.Conn) (sni string, consumed []byte, err error) {
-	hdr := make([]byte, tlsRecordHeaderLen)
-	n, err := io.ReadFull(c, hdr)
-	consumed = hdr[:n]
-	if err != nil {
-		return "", consumed, err
-	}
-
-	if hdr[0] != tlsHandshakeRecord {
-		// Not a TLS handshake — nothing to inspect, forward as-is.
-		return "", consumed, nil
-	}
-
-	recLen := int(hdr[3])<<8 | int(hdr[4])
-	if recLen <= 0 || recLen > maxTLSRecordLen {
-		return "", consumed, nil
-	}
-
-	body := make([]byte, recLen)
-	n, err = io.ReadFull(c, body)
-	consumed = append(consumed, body[:n]...)
-	if err != nil {
-		return "", consumed, err
-	}
-
-	return parseSNI(body), consumed, nil
-}
 
 // parseSNI extracts the host_name from a TLS handshake message body. It is
 // defensive: any malformed or truncated input yields "" rather than a panic.

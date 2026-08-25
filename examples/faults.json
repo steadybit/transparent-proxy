@@ -14,6 +14,11 @@
       "name": "blackhole-a-specific-cdn",
       "hosts": ["cdn.example.com"],
       "abortProbability": 1.0
+    },
+    {
+      "name": "return-503-for-internal-api",
+      "hosts": ["orders.internal"],
+      "httpStatus": 503
     }
   ]
 }

@@ -69,6 +69,9 @@ func TestToRules_Validation(t *testing.T) {
 		{"negative-latency", RuleDTO{Name: "bad", Latency: "-5s"}, true},
 		{"prob-too-high", RuleDTO{Name: "bad", AbortProbability: 1.5}, true},
 		{"prob-negative", RuleDTO{Name: "bad", AbortProbability: -0.1}, true},
+		{"ok-http-status", RuleDTO{Name: "ok", HTTPStatus: 503}, false},
+		{"bad-http-status-low", RuleDTO{Name: "bad", HTTPStatus: 42}, true},
+		{"bad-http-status-high", RuleDTO{Name: "bad", HTTPStatus: 700}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

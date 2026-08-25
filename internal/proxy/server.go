@@ -179,32 +179,33 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		return
 	}
 
-	// Identify the target by SNI only when a host rule could match this
-	// destination; otherwise stay on the pure-splice fast path and never touch
-	// the payload in userspace. The peek is deadline-bounded so a
-	// server-speaks-first protocol can't deadlock it.
+	// Sniff the payload only when a rule could match on identity or an L7 fault;
+	// otherwise stay on the pure-splice fast path and never touch the bytes. The
+	// read is deadline-bounded so a server-speaks-first protocol can't deadlock
+	// it, and on any error we fail toward forwarding (never dropping).
 	var (
-		sni    string
-		prefix []byte
+		proto    = protoOther
+		identity string
+		prefix   []byte
 	)
-	if s.Faults.InspectSNI(dst) {
+	if s.Faults.Inspect(dst) {
 		_ = client.SetReadDeadline(time.Now().Add(s.peekTimeout()))
-		sni, prefix, err = peekClientHello(client)
+		proto, identity, prefix, err = sniff(client)
 		_ = client.SetReadDeadline(time.Time{})
 		if err != nil {
-			// A failed/timed-out handshake read would leave us guessing the
-			// rule and replaying a truncated ClientHello upstream. Drop it.
-			s.Metrics.Dropped()
-			log.Debug("client hello peek failed; dropping connection",
+			// Uncertain input (timeout / partial / server-first): don't guess a
+			// rule or drop — forward what we read untouched (fail open).
+			log.Debug("payload sniff inconclusive; forwarding untouched",
 				slog.Any("err", err), slog.String("dst", dst.String()))
+			s.forward(ctx, log, client, dst, prefix)
 			return
 		}
 	}
 
-	action := s.Faults.Match(dst, sni)
+	action := s.Faults.Match(dst, identity)
 	log = log.With(
 		slog.String("dst", dst.String()),
-		slog.String("sni", sni),
+		slog.String("identity", identity),
 		slog.String("rule", action.Rule),
 	)
 
@@ -214,6 +215,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		reset(client)
 		return
 	}
+
 	if action.Latency > 0 {
 		select {
 		case <-time.After(action.Latency):
@@ -223,6 +225,23 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		}
 	}
 
+	// L7: synthesize an HTTP status response without contacting the upstream.
+	// Only valid for cleartext HTTP; ignored otherwise.
+	if proto == protoHTTP && action.HTTPStatus != 0 {
+		if err := writeHTTPStatus(client, action.HTTPStatus); err != nil {
+			log.Debug("failed to write injected status", slog.Any("err", err))
+		}
+		s.Metrics.Proxied()
+		log.Info("injected http status", slog.Int("status", action.HTTPStatus))
+		return
+	}
+
+	s.forward(ctx, log, client, dst, prefix)
+}
+
+// forward dials the upstream, replays any bytes consumed during sniffing, and
+// splices the connection through. Every terminal counter is recorded here.
+func (s *Server) forward(ctx context.Context, log *slog.Logger, client *net.TCPConn, dst netip.AddrPort, prefix []byte) {
 	upstream, err := s.dial(ctx, dst)
 	if err != nil {
 		s.Metrics.UpstreamError()
@@ -231,17 +250,15 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	}
 	defer func() { _ = upstream.Close() }()
 
-	// Replay the bytes consumed during SNI inspection, then splice the rest.
 	if len(prefix) > 0 {
 		if _, err := upstream.Write(prefix); err != nil {
-			log.Debug("failed to replay client hello", slog.Any("err", err))
+			log.Debug("failed to replay sniffed prefix", slog.Any("err", err))
 			return
 		}
 	}
 
 	log.Debug("proxying")
 	toUpstream, toClient := relay(client, upstream)
-	// Include the replayed ClientHello prefix in the upstream byte count.
 	s.Metrics.AddBytes(toUpstream+int64(len(prefix)), toClient)
 	s.Metrics.Proxied()
 }

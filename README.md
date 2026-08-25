@@ -10,11 +10,12 @@ target application needs **no reconfiguration**.
 > original-destination recovery (`SO_ORIGINAL_DST`), SNI-based targeting, the
 > fault engine, the **iptables interception layer** (REDIRECT capture, `SO_MARK`
 > self-loop protection, persistent connection-pool flush), **preflight mesh
-> detection**, **silent-no-op metrics**, and a **fail-open supervisor** that
-> guarantees rule teardown on every exit path. The capture path and the
-> fail-open teardown are verified end to end under real iptables (see the
-> `integration`-tagged tests). L7 HTTP faults and `action-kit` integration are
-> next on the roadmap below.
+> detection**, **silent-no-op metrics**, a **fail-open supervisor** that
+> guarantees rule teardown on every exit path, and **L7 HTTP faults** (Host-header
+> selection, status-code injection, byte-identical pass-through). The capture
+> path, connection-pool flush, L7 injection, and fail-open teardown are all
+> verified end to end under real iptables (see the `integration`-tagged tests).
+> `action-kit` integration is next on the roadmap below.
 
 ## Why a proxy (and not just tc/iptables)?
 
@@ -130,10 +131,15 @@ linuxkit, and `istio/proxyv2:1.24.2`). The research **confirms** REDIRECT +
 - [ ] **Over-broad selector guards.** Explicit default port list, exclude-nets
       **replicated into the filter table** (protect agent/platform/extension
       ports from reset), self-exclusion, and refuse `0.0.0.0/0` + "any port".
-- [ ] **L7 HTTP faults** via **parse-decide-replay**, *not* `httputil.ReverseProxy`
-      (which canonicalizes header casing/order and injects `X-Forwarded-For` /
-      `Accept-Encoding`). Host-header selection, case-insensitive. Sniff protocol
-      at ingress; non-HTTP on a matched port stays a raw byte-splice.
+- [x] **L7 HTTP faults** via **parse-decide-replay**, *not* `httputil.ReverseProxy`.
+      The proxy sniffs each connection at ingress (TLS vs HTTP vs opaque), and for
+      cleartext HTTP selects by **Host header** (case-insensitive, port-stripped —
+      same semantics as `dns-inject`) to **synthesize a status code** without
+      contacting the upstream. Non-matching / non-HTTP traffic is forwarded
+      **byte-identical** (header casing and order preserved), and on any sniff
+      timeout the connection is forwarded untouched (fail-open). *Still to come:
+      response-body tampering, per-request faulting on keep-alive connections,
+      and HTTP/2 (h2c).*
 - [ ] **`action-kit` integration**: per-execution chains `SB_HTTP_<last-12-of-exec-id>`,
       participate in `netfault.doesConflictWith()`, reuse `mapToNetworkFilter` /
       dnsinject `Exited()` teardown contract, sidecar delivery.

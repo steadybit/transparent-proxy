@@ -111,6 +111,36 @@ func TestInspectSNI(t *testing.T) {
 	}
 }
 
+func TestMatch_HTTPStatus(t *testing.T) {
+	e := NewEngine([]Rule{{Name: "503", Hosts: []string{"api.example.com"}, HTTPStatus: 503}})
+	if got := e.Match(addrPort(t, "1.2.3.4:80"), "api.example.com"); got.HTTPStatus != 503 {
+		t.Fatalf("HTTPStatus = %d, want 503", got.HTTPStatus)
+	}
+	if got := e.Match(addrPort(t, "1.2.3.4:80"), "other.com"); got.HTTPStatus != 0 {
+		t.Fatalf("non-matching host should not inject a status, got %d", got.HTTPStatus)
+	}
+}
+
+func TestInspect(t *testing.T) {
+	// A host rule triggers inspection (SNI or Host).
+	host := NewEngine([]Rule{{Name: "h", Hosts: []string{"x.com"}}})
+	if !host.Inspect(addrPort(t, "9.9.9.9:443")) {
+		t.Fatal("host rule should require inspection")
+	}
+	// An L7 status rule with no host still requires inspection (to read the head).
+	l7 := NewEngine([]Rule{{Name: "s", CIDRs: []netip.Prefix{mustPrefix(t, "10.0.0.0/8")}, HTTPStatus: 500}})
+	if !l7.Inspect(addrPort(t, "10.0.0.1:80")) {
+		t.Fatal("http-status rule should require inspection")
+	}
+	if l7.Inspect(addrPort(t, "9.9.9.9:80")) {
+		t.Fatal("http-status rule outside its CIDR should not require inspection")
+	}
+	// A plain CIDR latency rule never needs inspection.
+	if NewEngine([]Rule{{Name: "c", CIDRs: []netip.Prefix{mustPrefix(t, "10.0.0.0/8")}, Latency: 1}}).Inspect(addrPort(t, "10.0.0.1:80")) {
+		t.Fatal("cidr-only latency rule should not require inspection")
+	}
+}
+
 func TestNeedsSNI(t *testing.T) {
 	if NewEngine([]Rule{{Name: "cidr", CIDRs: []netip.Prefix{mustPrefix(t, "10.0.0.0/8")}}}).NeedsSNI() {
 		t.Fatal("CIDR-only rules should not need SNI")
