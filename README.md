@@ -92,6 +92,8 @@ make run       # run locally with examples/faults.json
 - [ ] **Fail-open supervisor**: tear down interception rules if the proxy dies so
       traffic falls back to direct.
 - [ ] Loop-prevention (uid/mark exemption incl. mesh proxy uid).
+- [ ] Relay **idle timeout** (activity-resetting deadlines) on top of the current
+      TCP keepalive, to reap stalled connections faster.
 - [ ] More faults: bandwidth throttle, jitter, partial/slow reads, L7 handlers.
 - [ ] `action-kit` integration (discovery + action wiring, sidecar delivery).
 

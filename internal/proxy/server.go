@@ -10,7 +10,6 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -18,6 +17,16 @@ import (
 
 	"github.com/steadybit/transparent-proxy/internal/fault"
 )
+
+const keepAlivePeriod = 30 * time.Second
+
+// enableKeepAlive turns on TCP keepalive so the kernel eventually reaps a
+// connection whose peer has gone away silently, bounding goroutine/socket leaks
+// in the deadline-less relay.
+func enableKeepAlive(c *net.TCPConn) {
+	_ = c.SetKeepAlive(true)
+	_ = c.SetKeepAlivePeriod(keepAlivePeriod)
+}
 
 // Server is a transparent TCP proxy.
 type Server struct {
@@ -37,6 +46,18 @@ type Server struct {
 
 	// DialTimeout bounds establishing the upstream connection.
 	DialTimeout time.Duration
+
+	// PeekTimeout bounds the TLS ClientHello read when SNI inspection applies,
+	// so server-speaks-first protocols (SMTP, MySQL, ...) don't deadlock the
+	// peek. Defaults to 5s.
+	PeekTimeout time.Duration
+}
+
+func (s *Server) peekTimeout() time.Duration {
+	if s.PeekTimeout > 0 {
+		return s.PeekTimeout
+	}
+	return 5 * time.Second
 }
 
 func (s *Server) logger() *slog.Logger {
@@ -67,40 +88,54 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if s.Faults == nil {
 		s.Faults = fault.NewEngine(nil)
 	}
-	inspect := s.Faults.NeedsSNI()
 	s.logger().Info("transparent-proxy listening",
 		slog.String("addr", ln.Addr().String()),
-		slog.Bool("sni_inspection", inspect))
+		slog.Bool("sni_inspection", s.Faults.NeedsSNI()))
 
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
 
+	var backoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				continue
+			// Keep serving on transient accept errors (e.g. EMFILE/ENFILE)
+			// with capped exponential backoff instead of tearing the proxy
+			// down and dropping every in-flight and future connection.
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else if backoff < time.Second {
+				backoff *= 2
 			}
-			return err
+			s.logger().Warn("accept error; backing off",
+				slog.Any("err", err), slog.Duration("delay", backoff))
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil
+			}
+			continue
 		}
+		backoff = 0
 		tcp, ok := conn.(*net.TCPConn)
 		if !ok {
 			_ = conn.Close()
 			continue
 		}
-		go s.handle(ctx, tcp, inspect)
+		go s.handle(ctx, tcp)
 	}
 }
 
-func (s *Server) handle(ctx context.Context, client *net.TCPConn, inspect bool) {
+func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	defer func() { _ = client.Close() }()
 	log := s.logger()
+
+	enableKeepAlive(client)
 
 	dst, err := s.resolve(client)
 	if err != nil {
@@ -108,16 +143,23 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn, inspect bool) 
 		return
 	}
 
-	// Identify the target by SNI only when a rule needs it; otherwise stay on
-	// the pure-splice fast path and never touch the payload in userspace.
+	// Identify the target by SNI only when a host rule could match this
+	// destination; otherwise stay on the pure-splice fast path and never touch
+	// the payload in userspace. The peek is deadline-bounded so a
+	// server-speaks-first protocol can't deadlock it.
 	var (
 		sni    string
 		prefix []byte
 	)
-	if inspect {
+	if s.Faults.InspectSNI(dst) {
+		_ = client.SetReadDeadline(time.Now().Add(s.peekTimeout()))
 		sni, prefix, err = peekClientHello(client)
-		if err != nil && len(prefix) == 0 {
-			log.Debug("client hello peek failed", slog.Any("err", err))
+		_ = client.SetReadDeadline(time.Time{})
+		if err != nil {
+			// A failed/timed-out handshake read would leave us guessing the
+			// rule and replaying a truncated ClientHello upstream. Drop it.
+			log.Debug("client hello peek failed; dropping connection",
+				slog.Any("err", err), slog.String("dst", dst.String()))
 			return
 		}
 	}
@@ -166,7 +208,7 @@ func (s *Server) dial(ctx context.Context, dst netip.AddrPort) (*net.TCPConn, er
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
-	d := net.Dialer{Timeout: timeout}
+	d := net.Dialer{Timeout: timeout, KeepAlive: keepAlivePeriod}
 	conn, err := d.DialContext(ctx, "tcp", dst.String())
 	if err != nil {
 		return nil, err

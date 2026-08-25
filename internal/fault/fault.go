@@ -47,25 +47,36 @@ type Action struct {
 // Engine holds an ordered rule set. The first matching rule wins.
 type Engine struct {
 	rules []Rule
-	rng   *rand.Rand
 }
 
 // NewEngine builds an engine from rules. A nil/empty rule set yields an
 // engine that never injects a fault (pure pass-through).
 func NewEngine(rules []Rule) *Engine {
-	// Deterministic seed keeps behaviour reproducible across restarts; the
-	// probability roll only needs to be uniform, not cryptographically random.
-	return &Engine{
-		rules: rules,
-		rng:   rand.New(rand.NewPCG(0x9E3779B97F4A7C15, 0xBF58476D1CE4E5B9)),
-	}
+	return &Engine{rules: rules}
 }
 
-// NeedsSNI reports whether any rule selects on hostname. When false, the proxy
-// can take the pure-splice fast path and skip the ClientHello peek entirely.
+// NeedsSNI reports whether any rule selects on hostname at all. Used only for a
+// startup summary; per-connection gating uses InspectSNI so that connections no
+// host rule could match are never peeked.
 func (e *Engine) NeedsSNI() bool {
 	for _, r := range e.rules {
 		if len(r.Hosts) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// InspectSNI reports whether reading the TLS SNI is worthwhile for a connection
+// to dst — i.e. whether some host-selecting rule could match it (its CIDR
+// constraint, if any, already admits dst). When false, the proxy skips the
+// ClientHello peek for this connection and stays on the pure-splice fast path.
+func (e *Engine) InspectSNI(dst netip.AddrPort) bool {
+	for _, r := range e.rules {
+		if len(r.Hosts) == 0 {
+			continue
+		}
+		if cidrsMatch(r.CIDRs, dst.Addr()) {
 			return true
 		}
 	}
@@ -85,7 +96,9 @@ func (e *Engine) Match(dst netip.AddrPort, sni string) Action {
 		return Action{
 			Rule:    r.Name,
 			Latency: r.Latency,
-			Abort:   r.AbortProbability > 0 && e.rng.Float64() < r.AbortProbability,
+			// Top-level rand.Float64 is safe for concurrent use by the
+			// per-connection goroutines and independent across restarts.
+			Abort:   r.AbortProbability > 0 && rand.Float64() < r.AbortProbability,
 		}
 	}
 	return Action{}
