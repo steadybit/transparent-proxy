@@ -82,20 +82,51 @@ make run       # run locally with examples/faults.json
 
 ## Roadmap
 
-- [ ] **Interception backends**: iptables `REDIRECT` (default), `TPROXY` (UDP /
-      source preservation), eBPF (`sk_lookup`) for Cilium-owned datapaths.
-- [ ] **Preflight detection**: fingerprint Istio sidecar / ambient / Cilium
-      socketLB and pick a backend (or fail loud) instead of silently no-op'ing.
-- [ ] **One-shot connection reset** to churn warm connection pools so existing
-      flows re-establish *through* the proxy (long-lived pools otherwise bypass a
-      REDIRECT that only catches new conntrack flows).
-- [ ] **Fail-open supervisor**: tear down interception rules if the proxy dies so
-      traffic falls back to direct.
-- [ ] Loop-prevention (uid/mark exemption incl. mesh proxy uid).
-- [ ] Relay **idle timeout** (activity-resetting deadlines) on top of the current
-      TCP keepalive, to reap stalled connections faster.
-- [ ] More faults: bandwidth throttle, jitter, partial/slow reads, L7 handlers.
-- [ ] `action-kit` integration (discovery + action wiring, sidecar delivery).
+Refined by internal design research (validated against EKS/AL2023, GKE/COS,
+linuxkit, and `istio/proxyv2:1.24.2`). The research **confirms** REDIRECT +
+`splice` + Go stdlib; the items below capture its refinements.
+
+- [ ] **Self-loop protection (mandatory, do first).** `SO_MARK 0x5C` on the
+      proxy's upstream sockets + a `filter`-table RETURN exemption, plus a proxy
+      self-refusal when the recovered original destination is our own listener.
+      Without it a single request was measured producing **17,527 self-connections
+      in 8s**. (Mark `0x5C` avoids netfault's existing `0x5B`.)
+- [ ] **Connection-pool flush = persistent `filter` REJECT**, not one-shot
+      `ss -K`. Rule matches `-m conntrack --ctstate ESTABLISHED --dport <target>
+      -j REJECT --reject-with tcp-reset`; it fires on connection *use*, is
+      self-limiting (redirected flows can't re-match), and works on kernels
+      without `CONFIG_INET_DIAG_DESTROY`. `ss -K` only as a supplement, and only
+      after re-listing sockets to confirm it actually killed them (it exits 0
+      while killing nothing on unsupported kernels).
+- [ ] **Preflight detection.** Walk the iptables chain graph **2+ levels deep**
+      (flat OUTPUT scan misses Istio's `ISTIO_OUTPUT`→`ISTIO_REDIRECT`), query
+      **both** backends (Istio writes `legacy`; our tooling uses `nft`), scope to
+      `REDIRECT`/`TPROXY` only (not DNAT — else every host-network target is
+      refused), and treat a missing `--dport` as all-ports. Refuse under Istio /
+      Linkerd sidecars. eBPF-based redirection (Cilium socketLB) is undetectable
+      here — covered by the metric below.
+- [ ] **Silent no-op detection.** Expose `connections_matched` /
+      `requests_matched` so the platform can surface "0 connections intercepted"
+      (the Cilium/sockmap blind spot, and any mismatched selector).
+- [ ] **Fail-open supervisor.** A `nat` rule pointing at a dead proxy port
+      blackholes matched traffic — on proxy exit, tear down all rules and report
+      `Errored`.
+- [ ] **Over-broad selector guards.** Explicit default port list, exclude-nets
+      **replicated into the filter table** (protect agent/platform/extension
+      ports from reset), self-exclusion, and refuse `0.0.0.0/0` + "any port".
+- [ ] **L7 HTTP faults** via **parse-decide-replay**, *not* `httputil.ReverseProxy`
+      (which canonicalizes header casing/order and injects `X-Forwarded-For` /
+      `Accept-Encoding`). Host-header selection, case-insensitive. Sniff protocol
+      at ingress; non-HTTP on a matched port stays a raw byte-splice.
+- [ ] **`action-kit` integration**: per-execution chains `SB_HTTP_<last-12-of-exec-id>`,
+      participate in `netfault.doesConflictWith()`, reuse `mapToNetworkFilter` /
+      dnsinject `Exited()` teardown contract, sidecar delivery.
+- [ ] Relay **idle timeout** (activity-resetting deadlines) atop TCP keepalive.
+- [ ] Deferred: TPROXY (ingress / source preservation), IPv6, UDP, HTTP/2 (h2c),
+      SNI-based L4 faults (delay/reset/stall/byte-slice/bandwidth, no termination).
+
+Overhead reference: userspace hop measured at **+117µs p50 / +149µs p95** (not a
+meaningful fault on its own); static `CGO=0` binary ~8–14 MB.
 
 ## License
 
