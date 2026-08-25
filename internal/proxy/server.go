@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"syscall"
 	"time"
 
 	"github.com/steadybit/transparent-proxy/internal/fault"
@@ -51,6 +52,14 @@ type Server struct {
 	// so server-speaks-first protocols (SMTP, MySQL, ...) don't deadlock the
 	// peek. Defaults to 5s.
 	PeekTimeout time.Duration
+
+	// Mark, when non-zero, is stamped as SO_MARK on every upstream socket so the
+	// interception rules can exempt (RETURN) the proxy's own traffic. Without it
+	// the REDIRECT rule re-captures the proxy's upstream dial and self-loops.
+	Mark uint32
+
+	// listenPort is captured at Serve time for the self-loop guard.
+	listenPort int
 }
 
 func (s *Server) peekTimeout() time.Duration {
@@ -88,9 +97,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if s.Faults == nil {
 		s.Faults = fault.NewEngine(nil)
 	}
+	if a, ok := ln.Addr().(*net.TCPAddr); ok {
+		s.listenPort = a.Port
+	}
 	s.logger().Info("transparent-proxy listening",
 		slog.String("addr", ln.Addr().String()),
-		slog.Bool("sni_inspection", s.Faults.NeedsSNI()))
+		slog.Bool("sni_inspection", s.Faults.NeedsSNI()),
+		slog.Bool("loop_protection", s.Mark != 0))
 
 	go func() {
 		<-ctx.Done()
@@ -140,6 +153,14 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	dst, err := s.resolve(client)
 	if err != nil {
 		log.Warn("could not resolve original destination", slog.Any("err", err))
+		return
+	}
+
+	// Self-loop guard: never forward to our own listener. The SO_MARK exemption
+	// is the primary defence, but if a redirected flow still resolves back to
+	// this proxy, forwarding it would spiral into a connection storm.
+	if s.isSelf(dst) {
+		log.Warn("refusing to forward to own listener (loop guard)", slog.String("dst", dst.String()))
 		return
 	}
 
@@ -209,11 +230,26 @@ func (s *Server) dial(ctx context.Context, dst netip.AddrPort) (*net.TCPConn, er
 		timeout = 10 * time.Second
 	}
 	d := net.Dialer{Timeout: timeout, KeepAlive: keepAlivePeriod}
+	if s.Mark != 0 {
+		mark := s.Mark
+		d.Control = func(_, _ string, c syscall.RawConn) error {
+			var markErr error
+			if err := c.Control(func(fd uintptr) { markErr = setSocketMark(fd, mark) }); err != nil {
+				return err
+			}
+			return markErr
+		}
+	}
 	conn, err := d.DialContext(ctx, "tcp", dst.String())
 	if err != nil {
 		return nil, err
 	}
 	return conn.(*net.TCPConn), nil
+}
+
+// isSelf reports whether dst points back at this proxy's own listener.
+func (s *Server) isSelf(dst netip.AddrPort) bool {
+	return s.listenPort != 0 && int(dst.Port()) == s.listenPort && dst.Addr().IsLoopback()
 }
 
 // reset closes c with a TCP RST rather than a graceful FIN, so the client sees

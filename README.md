@@ -6,10 +6,13 @@ an out-of-band iptables `REDIRECT`/`TPROXY` rule (the same namespace-injection
 machinery Steadybit's `action-kit` already uses for network attacks), so the
 target application needs **no reconfiguration**.
 
-> ⚠️ **Status: early scaffold / work in progress.** The L4 relay, original-
-> destination recovery, SNI-based targeting, and fault engine are implemented and
-> tested. The interception (iptables/eBPF) backends, preflight detection, and the
-> one-shot connection-reset resurrection are on the roadmap below.
+> ⚠️ **Status: work in progress.** Implemented and tested: the L4 relay,
+> original-destination recovery (`SO_ORIGINAL_DST`), SNI-based targeting, the
+> fault engine, and the **iptables interception layer** — REDIRECT capture,
+> `SO_MARK` self-loop protection, and the persistent connection-pool flush. The
+> full capture path is verified end to end under real iptables (see the
+> `integration`-tagged tests). Preflight detection, silent-no-op metrics,
+> fail-open teardown, and L7 HTTP faults are on the roadmap below.
 
 ## Why a proxy (and not just tc/iptables)?
 
@@ -86,18 +89,22 @@ Refined by internal design research (validated against EKS/AL2023, GKE/COS,
 linuxkit, and `istio/proxyv2:1.24.2`). The research **confirms** REDIRECT +
 `splice` + Go stdlib; the items below capture its refinements.
 
-- [ ] **Self-loop protection (mandatory, do first).** `SO_MARK 0x5C` on the
-      proxy's upstream sockets + a `filter`-table RETURN exemption, plus a proxy
+- [x] **REDIRECT interception** (`internal/interception`): `iptables-restore`
+      script generation for nat REDIRECT to the proxy port, per-execution chains
+      `SB_TP_REDIR_<id12>` / `SB_TP_FLUSH_<id12>`, add/delete, and an injectable
+      `CommandRunner` for netns execution.
+- [x] **Self-loop protection (mandatory).** `SO_MARK 0x5C` on the proxy's
+      upstream sockets + a `filter`/`nat` RETURN exemption, plus a proxy
       self-refusal when the recovered original destination is our own listener.
       Without it a single request was measured producing **17,527 self-connections
       in 8s**. (Mark `0x5C` avoids netfault's existing `0x5B`.)
-- [ ] **Connection-pool flush = persistent `filter` REJECT**, not one-shot
+- [x] **Connection-pool flush = persistent `filter` REJECT**, not one-shot
       `ss -K`. Rule matches `-m conntrack --ctstate ESTABLISHED --dport <target>
       -j REJECT --reject-with tcp-reset`; it fires on connection *use*, is
       self-limiting (redirected flows can't re-match), and works on kernels
       without `CONFIG_INET_DIAG_DESTROY`. `ss -K` only as a supplement, and only
       after re-listing sockets to confirm it actually killed them (it exits 0
-      while killing nothing on unsupported kernels).
+      while killing nothing on unsupported kernels) — *supplement not yet added*.
 - [ ] **Preflight detection.** Walk the iptables chain graph **2+ levels deep**
       (flat OUTPUT scan misses Istio's `ISTIO_OUTPUT`→`ISTIO_REDIRECT`), query
       **both** backends (Istio writes `legacy`; our tooling uses `nft`), scope to

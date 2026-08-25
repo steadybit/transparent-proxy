@@ -19,6 +19,7 @@ import (
 
 	"github.com/steadybit/transparent-proxy/internal/config"
 	"github.com/steadybit/transparent-proxy/internal/fault"
+	"github.com/steadybit/transparent-proxy/internal/interception"
 	"github.com/steadybit/transparent-proxy/internal/proxy"
 )
 
@@ -28,6 +29,7 @@ func main() {
 		rulesPath   = flag.String("config", "", "path to a JSON fault-rules file (optional; empty = pure pass-through)")
 		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		dialTimeout = flag.Duration("dial-timeout", 10*time.Second, "upstream connection timeout")
+		mark        = flag.Uint("mark", uint(interception.DefaultMark), "SO_MARK stamped on upstream sockets for interception loop-protection (0 disables)")
 	)
 	flag.Parse()
 
@@ -53,6 +55,7 @@ func main() {
 		Faults:      fault.NewEngine(rules),
 		Logger:      logger,
 		DialTimeout: *dialTimeout,
+		Mark:        uint32(*mark),
 	}
 
 	if err := srv.Run(ctx); err != nil {

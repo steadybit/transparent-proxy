@@ -101,6 +101,39 @@ func TestServer_AbortResetsConnection(t *testing.T) {
 	}
 }
 
+func TestServer_SelfLoopGuard(t *testing.T) {
+	// An upstream echo that must never be reached.
+	echo := startEcho(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	self := ln.Addr().(*net.TCPAddr).AddrPort()
+
+	// ResolveDst points every connection back at the proxy's own listener.
+	s := &Server{
+		Faults:     fault.NewEngine(nil),
+		ResolveDst: func(*net.TCPConn) (netip.AddrPort, error) { return self, nil },
+	}
+	_ = echo
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = s.Serve(ctx, ln) }()
+
+	conn, err := net.DialTimeout("tcp", self.String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	// The loop guard should drop the connection rather than dialing itself.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected the self-referential connection to be dropped")
+	}
+}
+
 func TestServer_LatencyDelaysConnect(t *testing.T) {
 	echo := startEcho(t)
 	engine := fault.NewEngine([]fault.Rule{{Name: "slow", Latency: 300 * time.Millisecond}})
