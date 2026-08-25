@@ -35,5 +35,5 @@ jobs:
       # Exercises SO_ORIGINAL_DST recovery, the full REDIRECT capture path (with
       # SO_MARK loop protection), and live mesh preflight detection against real
       # iptables (needs root).
-      - name: Interception, preflight & fail-open teardown under real iptables
-        run: sudo env "PATH=$PATH" "HOME=$HOME" go test -tags integration -run 'TestOriginalDst|TestRedirect|TestDetect_Live|TestGuard_RealTeardown' ./internal/proxy/ ./internal/preflight/ ./internal/supervisor/ -v
+      - name: Interception, preflight, fail-open & end-to-end under real iptables
+        run: sudo env "PATH=$PATH" "HOME=$HOME" go test -tags integration -run 'TestOriginalDst|TestRedirect|TestDetect_Live|TestGuard_RealTeardown|TestE2E' ./internal/proxy/ ./internal/preflight/ ./internal/supervisor/ -v
