@@ -1,0 +1,19 @@
+{
+  "rules": [
+    {
+      "name": "slow-external-payments-api",
+      "hosts": ["api.stripe.com"],
+      "latency": "500ms"
+    },
+    {
+      "name": "flaky-internal-database",
+      "cidrs": ["10.0.0.0/8"],
+      "abortProbability": 0.25
+    },
+    {
+      "name": "blackhole-a-specific-cdn",
+      "hosts": ["cdn.example.com"],
+      "abortProbability": 1.0
+    }
+  ]
+}

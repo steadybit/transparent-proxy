@@ -1,0 +1,13 @@
+# Binaries
+/transparent-proxy
+/dist/
+*.exe
+
+# Test / coverage
+*.out
+coverage.*
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
