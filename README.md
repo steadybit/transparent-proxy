@@ -105,13 +105,15 @@ linuxkit, and `istio/proxyv2:1.24.2`). The research **confirms** REDIRECT +
       without `CONFIG_INET_DIAG_DESTROY`. `ss -K` only as a supplement, and only
       after re-listing sockets to confirm it actually killed them (it exits 0
       while killing nothing on unsupported kernels) — *supplement not yet added*.
-- [ ] **Preflight detection.** Walk the iptables chain graph **2+ levels deep**
-      (flat OUTPUT scan misses Istio's `ISTIO_OUTPUT`→`ISTIO_REDIRECT`), query
-      **both** backends (Istio writes `legacy`; our tooling uses `nft`), scope to
-      `REDIRECT`/`TPROXY` only (not DNAT — else every host-network target is
-      refused), and treat a missing `--dport` as all-ports. Refuse under Istio /
-      Linkerd sidecars. eBPF-based redirection (Cilium socketLB) is undetectable
-      here — covered by the metric below.
+- [x] **Preflight detection** (`internal/preflight`). Walks the iptables chain
+      graph **2+ levels deep** (flat OUTPUT scan misses Istio's
+      `ISTIO_OUTPUT`→`ISTIO_REDIRECT`), queries **both** backends (Istio writes
+      `legacy`; our tooling uses `nft`) across the nat + mangle tables, scopes to
+      `REDIRECT`/`TPROXY` only (not DNAT — kube-proxy is not flagged), treats a
+      missing `--dport` as all-ports, and refuses only on a real port overlap.
+      Classifies Istio / Linkerd. Wired via `--preflight-ports`; verified against
+      a live Istio-shaped ruleset. eBPF redirection (Cilium socketLB) is
+      undetectable here — covered by the metric below.
 - [ ] **Silent no-op detection.** Expose `connections_matched` /
       `requests_matched` so the platform can surface "0 connections intercepted"
       (the Cilium/sockmap blind spot, and any mismatched selector).

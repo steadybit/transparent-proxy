@@ -10,16 +10,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/steadybit/transparent-proxy/internal/config"
 	"github.com/steadybit/transparent-proxy/internal/fault"
 	"github.com/steadybit/transparent-proxy/internal/interception"
+	"github.com/steadybit/transparent-proxy/internal/preflight"
 	"github.com/steadybit/transparent-proxy/internal/proxy"
 )
 
@@ -30,6 +35,7 @@ func main() {
 		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		dialTimeout = flag.Duration("dial-timeout", 10*time.Second, "upstream connection timeout")
 		mark        = flag.Uint("mark", uint(interception.DefaultMark), "SO_MARK stamped on upstream sockets for interception loop-protection (0 disables)")
+		prePorts    = flag.String("preflight-ports", "", "comma-separated target ports; if set, refuse to start when an existing transparent proxy (mesh) already captures any of them")
 	)
 	flag.Parse()
 
@@ -50,6 +56,24 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if *prePorts != "" {
+		ports, err := parsePorts(*prePorts)
+		if err != nil {
+			logger.Error("invalid --preflight-ports", slog.Any("err", err))
+			os.Exit(2)
+		}
+		res, err := preflight.Detect(ctx, interception.ExecRunner{})
+		if err != nil {
+			logger.Error("preflight scan failed; cannot verify the namespace is clear", slog.Any("err", err))
+			os.Exit(1)
+		}
+		if f, conflict := res.Conflict(ports); conflict {
+			logger.Error("preflight refusal", slog.String("reason", f.Message()))
+			os.Exit(1)
+		}
+		logger.Info("preflight clean", slog.Any("backends", res.Backends))
+	}
+
 	srv := &proxy.Server{
 		Listen:      *listen,
 		Faults:      fault.NewEngine(rules),
@@ -63,6 +87,25 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("proxy stopped")
+}
+
+func parsePorts(s string) ([]uint16, error) {
+	var out []uint16
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		n, err := strconv.ParseUint(p, 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port %q: %w", p, err)
+		}
+		out = append(out, uint16(n))
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no ports provided")
+	}
+	return out, nil
 }
 
 func parseLevel(s string) slog.Level {

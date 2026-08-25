@@ -32,7 +32,8 @@ jobs:
         with:
           go-version: "1.25"
           check-latest: true
-      # Exercises SO_ORIGINAL_DST recovery and the full REDIRECT capture path
-      # (with SO_MARK loop protection) against real iptables (needs root).
-      - name: Interception under real iptables
-        run: sudo env "PATH=$PATH" "HOME=$HOME" go test -tags integration -run 'TestOriginalDst|TestRedirect' ./internal/proxy/ -v
+      # Exercises SO_ORIGINAL_DST recovery, the full REDIRECT capture path (with
+      # SO_MARK loop protection), and live mesh preflight detection against real
+      # iptables (needs root).
+      - name: Interception & preflight under real iptables
+        run: sudo env "PATH=$PATH" "HOME=$HOME" go test -tags integration -run 'TestOriginalDst|TestRedirect|TestDetect_Live' ./internal/proxy/ ./internal/preflight/ -v
