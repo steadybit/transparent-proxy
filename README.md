@@ -8,11 +8,13 @@ target application needs **no reconfiguration**.
 
 > ⚠️ **Status: work in progress.** Implemented and tested: the L4 relay,
 > original-destination recovery (`SO_ORIGINAL_DST`), SNI-based targeting, the
-> fault engine, and the **iptables interception layer** — REDIRECT capture,
-> `SO_MARK` self-loop protection, and the persistent connection-pool flush. The
-> full capture path is verified end to end under real iptables (see the
-> `integration`-tagged tests). Preflight detection, silent-no-op metrics,
-> fail-open teardown, and L7 HTTP faults are on the roadmap below.
+> fault engine, the **iptables interception layer** (REDIRECT capture, `SO_MARK`
+> self-loop protection, persistent connection-pool flush), **preflight mesh
+> detection**, **silent-no-op metrics**, and a **fail-open supervisor** that
+> guarantees rule teardown on every exit path. The capture path and the
+> fail-open teardown are verified end to end under real iptables (see the
+> `integration`-tagged tests). L7 HTTP faults and `action-kit` integration are
+> next on the roadmap below.
 
 ## Why a proxy (and not just tc/iptables)?
 
@@ -114,12 +116,17 @@ linuxkit, and `istio/proxyv2:1.24.2`). The research **confirms** REDIRECT +
       Classifies Istio / Linkerd. Wired via `--preflight-ports`; verified against
       a live Istio-shaped ruleset. eBPF redirection (Cilium socketLB) is
       undetectable here — covered by the metric below.
-- [ ] **Silent no-op detection.** Expose `connections_matched` /
-      `requests_matched` so the platform can surface "0 connections intercepted"
-      (the Cilium/sockmap blind spot, and any mismatched selector).
-- [ ] **Fail-open supervisor.** A `nat` rule pointing at a dead proxy port
-      blackholes matched traffic — on proxy exit, tear down all rules and report
-      `Errored`.
+- [x] **Silent no-op detection** (`internal/metrics`). `connections_matched`
+      (plus active/proxied/aborted/dropped/upstream-errors/bytes) exposed as JSON
+      via `--metrics-addr`, so the platform can surface "0 connections
+      intercepted" (the Cilium/sockmap blind spot, and any mismatched selector).
+- [x] **Fail-open supervisor** (`internal/supervisor`). A `Guard` ties the
+      interception rules to the proxy's lifetime and **guarantees teardown on
+      every exit path** — normal return, serve error, context cancellation,
+      panic, or a deadman (`--max-duration`) — idempotently and with retries. A
+      failed apply rolls back. Verified against real iptables (return + panic).
+      (A `SIGKILL` residual is the orchestrator's job via an `Exited()` hook,
+      which can call `Guard.Teardown` directly.)
 - [ ] **Over-broad selector guards.** Explicit default port list, exclude-nets
       **replicated into the filter table** (protect agent/platform/extension
       ports from reset), self-exclusion, and refuse `0.0.0.0/0` + "any port".

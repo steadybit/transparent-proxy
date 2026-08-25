@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/steadybit/transparent-proxy/internal/fault"
+	"github.com/steadybit/transparent-proxy/internal/metrics"
 )
 
 // startEcho starts a TCP echo server and returns its address.
@@ -101,6 +102,65 @@ func TestServer_AbortResetsConnection(t *testing.T) {
 	if _, err := conn.Read(buf); err == nil {
 		t.Fatal("expected the aborted connection to fail, got a successful read")
 	}
+}
+
+func eventually(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not met within deadline")
+}
+
+func TestServer_MetricsRecordProxiedConnection(t *testing.T) {
+	echo := startEcho(t)
+	m := metrics.New()
+	proxyAddr := serveProxy(t, &Server{Faults: fault.NewEngine(nil), Metrics: m}, echo)
+
+	conn, err := net.DialTimeout("tcp", proxyAddr.String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	msg := []byte("measure me")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, len(msg))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	// Matched increments synchronously once the destination resolves.
+	eventually(t, func() bool { return m.Snapshot().ConnectionsMatched == 1 })
+
+	_ = conn.Close()
+	// Proxied + byte counts settle once both halves close.
+	eventually(t, func() bool {
+		s := m.Snapshot()
+		return s.ConnectionsProxied == 1 && s.BytesToUpstream == int64(len(msg)) && s.ConnectionsActive == 0
+	})
+}
+
+func TestServer_MetricsRecordAbort(t *testing.T) {
+	echo := startEcho(t)
+	m := metrics.New()
+	engine := fault.NewEngine([]fault.Rule{{Name: "kill", AbortProbability: 1.0}})
+	proxyAddr := serveProxy(t, &Server{Faults: engine, Metrics: m}, echo)
+
+	conn, err := net.DialTimeout("tcp", proxyAddr.String(), 2*time.Second)
+	if err == nil {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, _ = conn.Read(make([]byte, 1))
+		_ = conn.Close()
+	}
+	eventually(t, func() bool {
+		s := m.Snapshot()
+		return s.ConnectionsMatched == 1 && s.ConnectionsAborted == 1
+	})
 }
 
 func TestServer_SelfLoopGuard(t *testing.T) {

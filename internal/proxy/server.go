@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/steadybit/transparent-proxy/internal/fault"
+	"github.com/steadybit/transparent-proxy/internal/metrics"
 )
 
 const keepAlivePeriod = 30 * time.Second
@@ -57,6 +58,10 @@ type Server struct {
 	// interception rules can exempt (RETURN) the proxy's own traffic. Without it
 	// the REDIRECT rule re-captures the proxy's upstream dial and self-loops.
 	Mark uint32
+
+	// Metrics, if set, records per-connection outcomes. A zero
+	// ConnectionsMatched under load is the canonical silent-no-op signal.
+	Metrics *metrics.Metrics
 
 	// listenPort is captured at Serve time for the self-loop guard.
 	listenPort int
@@ -156,10 +161,16 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		return
 	}
 
+	// A resolved connection is one the interception delivered to us; count it so
+	// a zero ConnectionsMatched exposes a silent no-op (e.g. Cilium socketLB).
+	done := s.Metrics.MatchedConnection()
+	defer done()
+
 	// Self-loop guard: never forward to our own listener. The SO_MARK exemption
 	// is the primary defence, but if a redirected flow still resolves back to
 	// this proxy, forwarding it would spiral into a connection storm.
 	if s.isSelf(dst) {
+		s.Metrics.Dropped()
 		log.Warn("refusing to forward to own listener (loop guard)", slog.String("dst", dst.String()))
 		return
 	}
@@ -179,6 +190,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		if err != nil {
 			// A failed/timed-out handshake read would leave us guessing the
 			// rule and replaying a truncated ClientHello upstream. Drop it.
+			s.Metrics.Dropped()
 			log.Debug("client hello peek failed; dropping connection",
 				slog.Any("err", err), slog.String("dst", dst.String()))
 			return
@@ -193,6 +205,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	)
 
 	if action.Abort {
+		s.Metrics.Aborted()
 		log.Info("aborting connection (reset)")
 		reset(client)
 		return
@@ -207,6 +220,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 
 	upstream, err := s.dial(ctx, dst)
 	if err != nil {
+		s.Metrics.UpstreamError()
 		log.Warn("upstream dial failed", slog.Any("err", err))
 		return
 	}
@@ -221,7 +235,9 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	}
 
 	log.Debug("proxying")
-	relay(client, upstream)
+	toUpstream, toClient := relay(client, upstream)
+	s.Metrics.AddBytes(toUpstream, toClient)
+	s.Metrics.Proxied()
 }
 
 func (s *Server) dial(ctx context.Context, dst netip.AddrPort) (*net.TCPConn, error) {
