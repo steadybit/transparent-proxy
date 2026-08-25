@@ -135,25 +135,29 @@ func (c Config) AddScript() []string {
 	return s
 }
 
-// DeleteScript returns the iptables-restore script that removes the rules.
-func (c Config) DeleteScript() []string {
+// DeleteCommands returns the individual iptables commands (argv after the
+// binary) that remove the interception. Unlike a single iptables-restore
+// transaction — which aborts the whole table on the first missing rule and can
+// leave a live REDIRECT behind after a partial apply — these run independently
+// and best-effort. The ordering matters: the chain flush (`-F`), which is what
+// actually removes the dead-port REDIRECT, runs regardless of whether unhooking
+// a jump succeeded.
+func (c Config) DeleteCommands() [][]string {
 	redir := c.redirectChain()
 	flush := c.flushChain()
 
-	var s []string
-	s = append(s, "*nat")
+	var cmds [][]string
 	for _, h := range c.hooks() {
-		s = append(s, fmt.Sprintf("-D %s -p tcp -j %s", h, redir))
+		cmds = append(cmds, []string{"-t", "nat", "-D", h, "-p", "tcp", "-j", redir})
 	}
-	s = append(s, fmt.Sprintf("-F %s", redir), fmt.Sprintf("-X %s", redir), "COMMIT")
+	cmds = append(cmds, []string{"-t", "nat", "-F", redir}, []string{"-t", "nat", "-X", redir})
 
-	s = append(s, "*filter")
 	for _, h := range c.hooks() {
-		s = append(s, fmt.Sprintf("-D %s -j %s", h, flush))
+		cmds = append(cmds, []string{"-t", "filter", "-D", h, "-j", flush})
 	}
-	s = append(s, fmt.Sprintf("-F %s", flush), fmt.Sprintf("-X %s", flush), "COMMIT")
+	cmds = append(cmds, []string{"-t", "filter", "-F", flush}, []string{"-t", "filter", "-X", flush})
 
-	return s
+	return cmds
 }
 
 // CommandRunner runs a command with the given stdin lines. Extensions inject a
@@ -187,10 +191,39 @@ func (c Config) Apply(ctx context.Context, r CommandRunner) error {
 	return err
 }
 
-// Revert removes the interception via iptables-restore.
+// Revert removes the interception. Every delete runs best-effort (a missing
+// rule/chain from a partial apply is not an error), then a verification pass
+// confirms neither chain still contains rules — so the caller (the fail-open
+// supervisor) only sees success once the dead-port REDIRECT is provably gone.
 func (c Config) Revert(ctx context.Context, r CommandRunner) error {
-	_, err := r.Run(ctx, []string{"iptables-restore", "-w", "-n"}, c.DeleteScript())
-	return err
+	for _, cmd := range c.DeleteCommands() {
+		// Ignore per-command errors: "does not exist" is the expected outcome
+		// for rules a partial apply never installed.
+		_, _ = r.Run(ctx, append([]string{"iptables", "-w"}, cmd...), nil)
+	}
+	return c.verifyClean(ctx, r)
+}
+
+// verifyClean fails if either interception chain still holds rules (an -A line),
+// i.e. the dangerous REDIRECT/REJECT is still installed. A missing chain (the
+// list command errors) is clean.
+func (c Config) verifyClean(ctx context.Context, r CommandRunner) error {
+	checks := []struct{ table, chain string }{
+		{"nat", c.redirectChain()},
+		{"filter", c.flushChain()},
+	}
+	for _, chk := range checks {
+		out, err := r.Run(ctx, []string{"iptables", "-w", "-t", chk.table, "-S", chk.chain}, nil)
+		if err != nil {
+			continue // chain absent => nothing left to remove
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "-A ") {
+				return fmt.Errorf("interception chain %s in table %s still contains rules after teardown", chk.chain, chk.table)
+			}
+		}
+	}
+	return nil
 }
 
 // includeV4 returns the string form of every IPv4 (or v4-mapped) prefix; IPv6

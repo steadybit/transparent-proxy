@@ -129,33 +129,55 @@ func (r Result) Conflict(targetPorts []uint16) (Finding, bool) {
 	return Finding{}, false
 }
 
+// BackendGeneric is the fallback probed via the plain `iptables` binary on
+// hosts (Alpine, slim containers) that ship no legacy/nft variant symlinks.
+const BackendGeneric Backend = "generic"
+
+// genericBin is the fallback binary and the one interception itself drives, so
+// if it works, the proxy can operate even when the variant probes fail.
+var genericBackend = struct {
+	name Backend
+	bin  string
+}{BackendGeneric, "iptables"}
+
 // tables scanned per backend: REDIRECT lives in nat, TPROXY in mangle.
 var tables = []string{"nat", "mangle"}
 
-// Detect scans both iptables backends across the nat and mangle tables. It
-// errors only if no backend could be queried at all (so "clean" is never
-// inferred from a total probe failure).
+// Detect scans the iptables backends across the nat and mangle tables. It tries
+// the legacy and nft variants first; if neither responds (e.g. an Alpine host
+// with only a plain `iptables`), it falls back to that generic binary — the
+// same one interception uses — so preflight never refuses a host interception
+// could actually work on. It errors only if nothing could be queried at all
+// (so "clean" is never inferred from a total probe failure).
 func Detect(ctx context.Context, runner Runner) (Result, error) {
 	var res Result
 	queried := map[Backend]bool{}
-	for _, b := range backends {
+
+	probe := func(name Backend, bin string) {
 		for _, table := range tables {
-			out, err := runner.Run(ctx, []string{b.bin, "-t", table, "-S"}, nil)
+			out, err := runner.Run(ctx, []string{bin, "-t", table, "-S"}, nil)
 			if err != nil {
-				// Binary missing or table unavailable: skip.
-				continue
+				continue // binary missing or table unavailable
 			}
-			queried[b.name] = true
-			res.Findings = append(res.Findings, parseFindings(b.name, table, out)...)
+			queried[name] = true
+			res.Findings = append(res.Findings, parseFindings(name, table, out)...)
 		}
 	}
+
 	for _, b := range backends {
-		if queried[b.name] {
-			res.Backends = append(res.Backends, b.name)
+		probe(b.name, b.bin)
+	}
+	if len(queried) == 0 {
+		probe(genericBackend.name, genericBackend.bin)
+	}
+
+	for _, b := range append(append([]Backend{}, BackendLegacy, BackendNFT), BackendGeneric) {
+		if queried[b] {
+			res.Backends = append(res.Backends, b)
 		}
 	}
 	if len(res.Backends) == 0 {
-		return res, fmt.Errorf("could not query any iptables backend (%s)", backendBins())
+		return res, fmt.Errorf("could not query any iptables backend (%s, %s)", backendBins(), genericBackend.bin)
 	}
 	return res, nil
 }

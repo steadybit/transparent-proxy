@@ -4,10 +4,10 @@
 
 package proxy
 
-import "errors"
-
-// setSocketMark is a no-op stub: SO_MARK exists only on Linux. Setting a mark on
-// any other platform is a configuration error rather than a silent success.
+// setSocketMark is a no-op on non-Linux platforms. SO_MARK only matters when the
+// proxy runs behind real iptables interception, which is Linux-only; treating it
+// as an error here would break the default configuration (Mark defaults non-zero
+// for loop protection) for local development and tests on macOS/Windows.
 func setSocketMark(uintptr, uint32) error {
-	return errors.New("SO_MARK (upstream loop protection) is only supported on linux")
+	return nil
 }

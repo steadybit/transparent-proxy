@@ -63,8 +63,11 @@ type Server struct {
 	// ConnectionsMatched under load is the canonical silent-no-op signal.
 	Metrics *metrics.Metrics
 
-	// listenPort is captured at Serve time for the self-loop guard.
+	// listenPort and localAddrs are captured at Serve time for the self-loop
+	// guard, so a redirected flow resolving back to this proxy (on loopback or
+	// any local interface address) is refused rather than dialed in a storm.
 	listenPort int
+	localAddrs map[netip.Addr]bool
 }
 
 func (s *Server) peekTimeout() time.Duration {
@@ -105,6 +108,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if a, ok := ln.Addr().(*net.TCPAddr); ok {
 		s.listenPort = a.Port
 	}
+	s.localAddrs = localInterfaceAddrs()
 	s.logger().Info("transparent-proxy listening",
 		slog.String("addr", ln.Addr().String()),
 		slog.Bool("sni_inspection", s.Faults.NeedsSNI()),
@@ -214,6 +218,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		select {
 		case <-time.After(action.Latency):
 		case <-ctx.Done():
+			s.Metrics.Dropped()
 			return
 		}
 	}
@@ -236,7 +241,8 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 
 	log.Debug("proxying")
 	toUpstream, toClient := relay(client, upstream)
-	s.Metrics.AddBytes(toUpstream, toClient)
+	// Include the replayed ClientHello prefix in the upstream byte count.
+	s.Metrics.AddBytes(toUpstream+int64(len(prefix)), toClient)
 	s.Metrics.Proxied()
 }
 
@@ -263,9 +269,31 @@ func (s *Server) dial(ctx context.Context, dst netip.AddrPort) (*net.TCPConn, er
 	return conn.(*net.TCPConn), nil
 }
 
-// isSelf reports whether dst points back at this proxy's own listener.
+// isSelf reports whether dst points back at this proxy's own listener — on
+// loopback or on any of this host's interface addresses.
 func (s *Server) isSelf(dst netip.AddrPort) bool {
-	return s.listenPort != 0 && int(dst.Port()) == s.listenPort && dst.Addr().IsLoopback()
+	if s.listenPort == 0 || int(dst.Port()) != s.listenPort {
+		return false
+	}
+	addr := dst.Addr().Unmap()
+	return addr.IsLoopback() || s.localAddrs[addr]
+}
+
+// localInterfaceAddrs snapshots this host's unicast IPs for the loop guard.
+func localInterfaceAddrs() map[netip.Addr]bool {
+	out := map[netip.Addr]bool{}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return out
+	}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			if ip, ok := netip.AddrFromSlice(ipn.IP); ok {
+				out[ip.Unmap()] = true
+			}
+		}
+	}
+	return out
 }
 
 // reset closes c with a TCP RST rather than a graceful FIN, so the client sees

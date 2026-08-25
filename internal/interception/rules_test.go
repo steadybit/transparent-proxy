@@ -5,6 +5,7 @@ package interception
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"strings"
 	"testing"
@@ -77,20 +78,40 @@ func TestAddScript_MarkExemptionFirst(t *testing.T) {
 	}
 }
 
-func TestDeleteScript_UnhookAndDropChains(t *testing.T) {
+func TestDeleteCommands_UnhookFlushDropOrder(t *testing.T) {
 	c := baseConfig(t)
-	script := joined(c.DeleteScript())
+	var lines []string
+	for _, cmd := range c.DeleteCommands() {
+		lines = append(lines, strings.Join(cmd, " "))
+	}
+	joinedCmds := strings.Join(lines, "\n")
+
 	for _, want := range []string{
-		"-D OUTPUT -p tcp -j SB_TP_REDIR_execid123456",
-		"-F SB_TP_REDIR_execid123456",
-		"-X SB_TP_REDIR_execid123456",
-		"-D OUTPUT -j SB_TP_FLUSH_execid123456",
-		"-F SB_TP_FLUSH_execid123456",
-		"-X SB_TP_FLUSH_execid123456",
+		"-t nat -D OUTPUT -p tcp -j SB_TP_REDIR_execid123456",
+		"-t nat -F SB_TP_REDIR_execid123456",
+		"-t nat -X SB_TP_REDIR_execid123456",
+		"-t filter -D OUTPUT -j SB_TP_FLUSH_execid123456",
+		"-t filter -F SB_TP_FLUSH_execid123456",
+		"-t filter -X SB_TP_FLUSH_execid123456",
 	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("DeleteScript missing: %s\n%s", want, script)
+		if !strings.Contains(joinedCmds, want) {
+			t.Errorf("DeleteCommands missing: %s\n%s", want, joinedCmds)
 		}
+	}
+
+	// The flush (-F), which removes the dead-port REDIRECT, must precede the
+	// chain drop (-X) so teardown still neutralises the rule if -X later fails.
+	flushIdx, dropIdx := -1, -1
+	for i, l := range lines {
+		if l == "-t nat -F SB_TP_REDIR_execid123456" {
+			flushIdx = i
+		}
+		if l == "-t nat -X SB_TP_REDIR_execid123456" {
+			dropIdx = i
+		}
+	}
+	if flushIdx == -1 || dropIdx == -1 || flushIdx > dropIdx {
+		t.Fatalf("flush (%d) must come before drop (%d)", flushIdx, dropIdx)
 	}
 }
 
@@ -169,5 +190,65 @@ func TestApplyRejectsInvalidConfig(t *testing.T) {
 	c.ProxyPort = 0
 	if err := c.Apply(context.Background(), &recordingRunner{}); err == nil {
 		t.Fatal("Apply should reject an invalid config before running anything")
+	}
+}
+
+// scriptRunner records calls and lets a test control per-command responses.
+type scriptRunner struct {
+	calls   [][]string
+	respond func(argv []string) (string, error)
+}
+
+func (s *scriptRunner) Run(_ context.Context, argv []string, _ []string) (string, error) {
+	s.calls = append(s.calls, argv)
+	if s.respond != nil {
+		return s.respond(argv)
+	}
+	return "", nil
+}
+
+func argvHas(argv []string, tok string) bool {
+	for _, a := range argv {
+		if a == tok {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRevert_BestEffortSucceedsWhenChainsGone(t *testing.T) {
+	c := baseConfig(t)
+	// Every delete "fails" (rules absent from a partial apply), and the verify
+	// list reports the chains are gone. Revert must still report success.
+	r := &scriptRunner{respond: func(argv []string) (string, error) {
+		if argvHas(argv, "-S") {
+			return "", errors.New("No chain/target/match by that name.")
+		}
+		return "", errors.New("iptables: Bad rule (does a matching rule exist in that chain?).")
+	}}
+	if err := c.Revert(context.Background(), r); err != nil {
+		t.Fatalf("Revert should succeed when chains are gone despite delete errors: %v", err)
+	}
+	for _, call := range r.calls {
+		if call[0] == "iptables-restore" {
+			t.Fatal("Revert must use individual iptables commands, not a restore transaction")
+		}
+	}
+}
+
+func TestRevert_FailsVerificationWhenRulesRemain(t *testing.T) {
+	c := baseConfig(t)
+	// The nat redirect chain still contains a rule (e.g. an unhook failed and
+	// -F somehow didn't take): verification must surface this as an error so the
+	// supervisor retries rather than reporting a clean teardown.
+	r := &scriptRunner{respond: func(argv []string) (string, error) {
+		if argvHas(argv, "-S") && argvHas(argv, "nat") {
+			return ":SB_TP_REDIR_execid123456 - [0:0]\n" +
+				"-A SB_TP_REDIR_execid123456 -p tcp -d 0.0.0.0/0 --dport 443 -j REDIRECT --to-ports 3128\n", nil
+		}
+		return "", nil
+	}}
+	if err := c.Revert(context.Background(), r); err == nil {
+		t.Fatal("Revert must fail verification while a chain still contains rules")
 	}
 }

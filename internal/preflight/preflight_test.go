@@ -159,6 +159,41 @@ func TestDetect_ErrorsWhenNoBackendAvailable(t *testing.T) {
 	}
 }
 
+func TestDetect_GenericFallbackWhenNoVariants(t *testing.T) {
+	// Only the plain `iptables` binary answers (Alpine/slim host). Detect must
+	// fall back to it rather than refusing a host interception could work on.
+	r := fakeRunner{outputs: map[string]string{
+		"iptables -t nat -S":    istioNat,
+		"iptables -t mangle -S": "-P PREROUTING ACCEPT",
+	}}
+	res, err := Detect(context.Background(), r)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if len(res.Backends) != 1 || res.Backends[0] != BackendGeneric {
+		t.Fatalf("expected the generic backend, got %v", res.Backends)
+	}
+	if _, conflict := res.Conflict([]uint16{443}); !conflict {
+		t.Fatal("generic-backend istio ruleset should still conflict with 443")
+	}
+}
+
+func TestDetect_VariantsPreemptGenericFallback(t *testing.T) {
+	// When a variant answers, the generic binary must NOT be probed (avoids
+	// double-counting the same rules on a normal host).
+	r := fakeRunner{outputs: map[string]string{
+		"iptables-nft -t nat -S": kubeProxyNat,
+		"iptables -t nat -S":     istioNat, // would add a false conflict if probed
+	}}
+	res, err := Detect(context.Background(), r)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if _, conflict := res.Conflict([]uint16{443}); conflict {
+		t.Fatal("generic fallback should not have been probed once nft answered")
+	}
+}
+
 func TestDetect_CleanNamespaceNoConflict(t *testing.T) {
 	r := fakeRunner{outputs: map[string]string{
 		"iptables-nft -t nat -S":    kubeProxyNat,
