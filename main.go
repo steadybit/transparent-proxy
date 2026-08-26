@@ -56,6 +56,14 @@ func main() {
 		execID         = flag.String("exec-id", "default", "execution id used to name the interception chains")
 
 		revert = flag.Bool("revert", false, "remove the interception rules for the given --exec-id/--intercept-* and exit (out-of-band teardown, idempotent)")
+
+		// Single-rule fault flags — a convenience for orchestrators that inject
+		// one fault, avoiding a JSON --config file. Appended to any --config rules.
+		faultLatency = flag.Duration("fault-latency", 0, "single fault: latency added before connecting upstream")
+		faultAbort   = flag.Float64("fault-abort-probability", 0, "single fault: probability [0,1] to reset the connection")
+		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7, cleartext HTTP)")
+		faultHosts   = flag.String("fault-hosts", "", "single fault: comma-separated host selectors (SNI/Host)")
+		faultCIDRs   = flag.String("fault-cidrs", "", "single fault: comma-separated CIDR selectors")
 	)
 	flag.Parse()
 
@@ -66,6 +74,12 @@ func main() {
 	if err != nil {
 		logger.Error("failed to load config", slog.Any("err", err))
 		os.Exit(1)
+	}
+	if fr, ok, ferr := buildFlagRule(*faultLatency, *faultAbort, *faultStatus, *faultHosts, *faultCIDRs); ferr != nil {
+		logger.Error("invalid fault flags", slog.Any("err", ferr))
+		os.Exit(2)
+	} else if ok {
+		rules = append(rules, fr)
 	}
 	if len(rules) > 0 {
 		logger.Info("loaded fault rules", slog.Int("count", len(rules)))
@@ -157,6 +171,32 @@ func loadRules(path string) ([]fault.Rule, error) {
 		return nil, nil
 	}
 	return config.Load(path)
+}
+
+// buildFlagRule assembles a single fault.Rule from the --fault-* flags. ok is
+// false when no fault flag is set.
+func buildFlagRule(latency time.Duration, abort float64, status int, hosts, cidrs string) (fault.Rule, bool, error) {
+	if latency == 0 && abort == 0 && status == 0 {
+		return fault.Rule{}, false, nil
+	}
+	if abort < 0 || abort > 1 {
+		return fault.Rule{}, false, fmt.Errorf("fault-abort-probability must be within [0,1], got %v", abort)
+	}
+	if status != 0 && (status < 100 || status > 599) {
+		return fault.Rule{}, false, fmt.Errorf("fault-http-status must be within [100,599], got %d", status)
+	}
+	r := fault.Rule{Name: "flag-rule", Latency: latency, AbortProbability: abort, HTTPStatus: status}
+	for _, h := range strings.Split(hosts, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			r.Hosts = append(r.Hosts, h)
+		}
+	}
+	prefixes, err := parseCIDRs(cidrs)
+	if err != nil {
+		return fault.Rule{}, false, fmt.Errorf("fault-cidrs: %w", err)
+	}
+	r.CIDRs = prefixes
+	return r, true, nil
 }
 
 // interceptorAdapter bridges an interception.Config to supervisor.Interceptor.
