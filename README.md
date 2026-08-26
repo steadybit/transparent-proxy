@@ -14,8 +14,14 @@ target application needs **no reconfiguration**.
 > guarantees rule teardown on every exit path, and **L7 HTTP faults** (Host-header
 > selection, status-code injection, byte-identical pass-through). The capture
 > path, connection-pool flush, L7 injection, and fail-open teardown are all
-> verified end to end under real iptables (see the `integration`-tagged tests).
-> `action-kit` integration is next on the roadmap below.
+> verified end to end under real iptables (see the `integration`-tagged tests),
+> and it is wired into a Steadybit host action (extension-host) that bundles this
+> binary and drives it in the target's network namespace.
+
+It ships as a small static binary bundled into Steadybit extensions (like
+`memfill`, `nsmount`, and `dns-inject`): the extension fetches
+`transparent-proxy.<arch>` from a release and launches it in the target's network
+namespace, where it self-manages its iptables interception and fault injection.
 
 ## Why a proxy (and not just tc/iptables)?
 
@@ -85,6 +91,15 @@ make linux     # static linux amd64 + arm64 (deployment targets)
 make test      # go test -race ./...
 make run       # run locally with examples/faults.json
 ```
+
+## Releases
+
+Pushing a `v*` tag builds stripped static linux binaries and publishes them as
+release assets named `transparent-proxy.amd64` / `transparent-proxy.arm64` (see
+`.github/workflows/ci.yml`). Extensions consume a pinned version by fetching that
+asset in their build (e.g. the `TRANSPARENT_PROXY_VERSION` env + a `curl` in the
+extension's goreleaser hook). Tags containing a hyphen (e.g. `v0.0.1-beta`) are
+marked as prereleases.
 
 ## Roadmap
 

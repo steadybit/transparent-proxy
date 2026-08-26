@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -37,3 +38,31 @@ jobs:
       # iptables (needs root).
       - name: Interception, preflight, fail-open & end-to-end under real iptables
         run: sudo env "PATH=$PATH" "HOME=$HOME" go test -tags integration -run 'TestOriginalDst|TestRedirect|TestDetect_Live|TestGuard_RealTeardown|TestE2E' ./internal/proxy/ ./internal/preflight/ ./internal/supervisor/ -v
+
+  # On a v* tag, publish stripped static linux binaries as release assets named
+  # transparent-proxy.<arch>, which extensions fetch in their goreleaser hook
+  # (matching the memfill/nsmount/dns-inject convention).
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-test, integration-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+      - name: Build release binaries
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o transparent-proxy.amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o transparent-proxy.arm64 .
+      - name: Publish GitHub Release
+        uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.14.0
+        with:
+          name: transparent-proxy ${{ github.ref_name }}
+          artifacts: "transparent-proxy.amd64,transparent-proxy.arm64,LICENSE"
+          generateReleaseNotes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          allowUpdates: true
