@@ -54,6 +54,8 @@ func main() {
 		interceptPorts = flag.String("intercept-ports", "", "comma-separated destination ports to capture (required with --intercept-cidrs)")
 		excludeCIDRs   = flag.String("exclude-cidrs", "", "comma-separated destinations never to touch (agent/platform)")
 		execID         = flag.String("exec-id", "default", "execution id used to name the interception chains")
+
+		revert = flag.Bool("revert", false, "remove the interception rules for the given --exec-id/--intercept-* and exit (out-of-band teardown, idempotent)")
 	)
 	flag.Parse()
 
@@ -92,6 +94,22 @@ func main() {
 	if err != nil {
 		logger.Error("invalid interception configuration", slog.Any("err", err))
 		os.Exit(2)
+	}
+
+	// Out-of-band teardown: remove the rules and exit. An orchestrator calls
+	// this (with the same exec-id/filter) to guarantee cleanup even if a prior
+	// self-managed process was SIGKILLed and its in-process Guard never ran.
+	if *revert {
+		if !wantIntercept {
+			logger.Error("--revert requires --intercept-cidrs and --intercept-ports")
+			os.Exit(2)
+		}
+		if err := interceptor.Revert(ctx); err != nil {
+			logger.Error("revert failed", slog.Any("err", err))
+			os.Exit(1)
+		}
+		logger.Info("interception reverted", slog.String("exec_id", *execID))
+		return
 	}
 
 	// Preflight: refuse to fight an existing mesh proxy. Ports default to the
