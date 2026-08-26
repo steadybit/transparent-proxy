@@ -103,8 +103,10 @@ func main() {
 		serveMetrics(ctx, logger, *metricsAddr, m)
 	}
 
-	// Build the interception config if self-managed mode is requested.
-	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), *listen)
+	// Validate the interception filter and whether self-managed mode is wanted.
+	// The port is filled in after we bind (below); 0 is fine here because this
+	// instance is only used for --revert, where the port is irrelevant.
+	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), 0)
 	if err != nil {
 		logger.Error("invalid interception configuration", slog.Any("err", err))
 		os.Exit(2)
@@ -139,16 +141,25 @@ func main() {
 		}
 	}
 
-	serve := func(ctx context.Context) error { return srv.Run(ctx) }
-
 	if wantIntercept {
-		guard := &supervisor.Guard{
-			Interceptor: interceptor,
-			Logger:      logger,
-			MaxDuration: *maxDuration,
+		// Bind the proxy port ourselves, then target interception at exactly the
+		// bound port — no pre-allocated port another process could steal between
+		// allocation and bind. --listen may use :0 for an OS-chosen port.
+		ln, lerr := net.Listen("tcp", *listen)
+		if lerr != nil {
+			logger.Error("failed to bind proxy listener", slog.Any("err", lerr))
+			os.Exit(1)
 		}
-		logger.Info("starting with self-managed interception (fail-open)", slog.String("exec_id", *execID))
-		err = guard.Run(ctx, serve)
+		port := uint16(ln.Addr().(*net.TCPAddr).Port)
+		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port)
+		if err != nil {
+			logger.Error("invalid interception configuration", slog.Any("err", err))
+			os.Exit(2)
+		}
+		guard := &supervisor.Guard{Interceptor: interceptor, Logger: logger, MaxDuration: *maxDuration}
+		logger.Info("starting with self-managed interception (fail-open)",
+			slog.String("exec_id", *execID), slog.Int("proxy_port", int(port)))
+		err = guard.Run(ctx, func(ctx context.Context) error { return srv.Serve(ctx, ln) })
 	} else {
 		runCtx := ctx
 		if *maxDuration > 0 {
@@ -156,7 +167,7 @@ func main() {
 			runCtx, cancel = context.WithTimeout(ctx, *maxDuration)
 			defer cancel()
 		}
-		err = serve(runCtx)
+		err = srv.Run(runCtx)
 	}
 
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
@@ -208,7 +219,12 @@ type interceptorAdapter struct {
 func (a interceptorAdapter) Apply(ctx context.Context) error  { return a.cfg.Apply(ctx, a.runner) }
 func (a interceptorAdapter) Revert(ctx context.Context) error { return a.cfg.Revert(ctx, a.runner) }
 
-func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, listen string) (supervisor.Interceptor, bool, error) {
+// buildInterceptor assembles the interception for the given proxy port. The
+// port is discovered by binding the listener first (see main), so interception
+// targets the exact port the proxy bound — there is no pre-allocated port that
+// another process could steal between allocation and bind. For --revert the
+// port is irrelevant (chain names derive from the exec-id) and may be 0.
+func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyPort uint16) (supervisor.Interceptor, bool, error) {
 	if cidrs == "" && ports == "" {
 		return nil, false, nil
 	}
@@ -227,11 +243,6 @@ func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, listen
 	tcpPorts, err := parsePorts(ports)
 	if err != nil {
 		return nil, false, fmt.Errorf("intercept-ports: %w", err)
-	}
-
-	proxyPort, err := listenPort(listen)
-	if err != nil {
-		return nil, false, err
 	}
 
 	cfg := interception.Config{
@@ -277,18 +288,6 @@ func serveMetrics(ctx context.Context, logger *slog.Logger, addr string, m *metr
 		}
 	}()
 	logger.Info("serving metrics", slog.String("addr", addr))
-}
-
-func listenPort(listen string) (uint16, error) {
-	_, port, err := net.SplitHostPort(listen)
-	if err != nil {
-		return 0, fmt.Errorf("invalid --listen %q: %w", listen, err)
-	}
-	n, err := strconv.ParseUint(port, 10, 16)
-	if err != nil || n == 0 {
-		return 0, fmt.Errorf("--listen must use a fixed non-zero port for interception, got %q", listen)
-	}
-	return uint16(n), nil
 }
 
 func parseCIDRs(s string) ([]netip.Prefix, error) {
