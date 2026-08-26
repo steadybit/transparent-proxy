@@ -28,13 +28,18 @@ type Rule struct {
 	CIDRs []netip.Prefix
 	Hosts []string
 
+	// Probability in [0,1] gates whether this rule's fault is applied to a given
+	// matching connection (the "affect X% of connections" knob). 0 (unset) means
+	// always (1.0); values >1 are treated as 1.0.
+	Probability float64
+
 	// Latency is added before the upstream connection is established,
 	// simulating a slow-to-connect dependency.
 	Latency time.Duration
 
-	// AbortProbability in [0,1] is the chance the connection is reset
-	// (RST) instead of being proxied, simulating a refused/flaky dependency.
-	AbortProbability float64
+	// Abort, when true, resets the connection (RST) instead of proxying it,
+	// simulating a refused/flaky dependency.
+	Abort bool
 
 	// HTTPStatus, if non-zero, makes the proxy synthesize an HTTP response with
 	// this status code instead of forwarding — an L7 fault that applies only to
@@ -120,12 +125,21 @@ func (e *Engine) Match(dst netip.AddrPort, identity string) Action {
 		if !hostsMatch(r.Hosts, identity) {
 			continue
 		}
+		// Probability roll gates the fault. A matched-but-not-faulted connection
+		// still returns the rule name (so it's counted) but carries no fault, so
+		// it is proxied through untouched. Top-level rand.Float64 is safe for
+		// concurrent use and independent across restarts.
+		p := r.Probability
+		if p <= 0 {
+			p = 1.0
+		}
+		if p < 1.0 && rand.Float64() >= p {
+			return Action{Rule: r.Name}
+		}
 		return Action{
-			Rule:    r.Name,
-			Latency: r.Latency,
-			// Top-level rand.Float64 is safe for concurrent use by the
-			// per-connection goroutines and independent across restarts.
-			Abort:      r.AbortProbability > 0 && rand.Float64() < r.AbortProbability,
+			Rule:       r.Name,
+			Latency:    r.Latency,
+			Abort:      r.Abort,
 			HTTPStatus: r.HTTPStatus,
 		}
 	}

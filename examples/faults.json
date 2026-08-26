@@ -8,12 +8,13 @@
     {
       "name": "flaky-internal-database",
       "cidrs": ["10.0.0.0/8"],
-      "abortProbability": 0.25
+      "abort": true,
+      "probability": 0.25
     },
     {
       "name": "blackhole-a-specific-cdn",
       "hosts": ["cdn.example.com"],
-      "abortProbability": 1.0
+      "abort": true
     },
     {
       "name": "return-503-for-internal-api",

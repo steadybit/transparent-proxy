@@ -85,7 +85,7 @@ func TestServer_PassThrough(t *testing.T) {
 
 func TestServer_AbortResetsConnection(t *testing.T) {
 	echo := startEcho(t)
-	engine := fault.NewEngine([]fault.Rule{{Name: "kill", AbortProbability: 1.0}})
+	engine := fault.NewEngine([]fault.Rule{{Name: "kill", Abort: true}})
 	proxyAddr := startProxy(t, echo, engine)
 
 	conn, err := net.DialTimeout("tcp", proxyAddr.String(), 2*time.Second)
@@ -148,7 +148,7 @@ func TestServer_MetricsRecordProxiedConnection(t *testing.T) {
 func TestServer_MetricsRecordAbort(t *testing.T) {
 	echo := startEcho(t)
 	m := metrics.New()
-	engine := fault.NewEngine([]fault.Rule{{Name: "kill", AbortProbability: 1.0}})
+	engine := fault.NewEngine([]fault.Rule{{Name: "kill", Abort: true}})
 	proxyAddr := serveProxy(t, &Server{Faults: engine, Metrics: m}, echo)
 
 	conn, err := net.DialTimeout("tcp", proxyAddr.String(), 2*time.Second)

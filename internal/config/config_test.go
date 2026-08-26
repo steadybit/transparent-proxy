@@ -13,7 +13,7 @@ import (
 func TestLoad_Valid(t *testing.T) {
 	data := `{
 	  "rules": [
-	    {"name": "r1", "cidrs": ["10.0.0.0/8"], "hosts": ["api.example.com"], "latency": "250ms", "abortProbability": 0.5}
+	    {"name": "r1", "cidrs": ["10.0.0.0/8"], "hosts": ["api.example.com"], "latency": "250ms", "abort": true, "probability": 0.5}
 	  ]
 	}`
 	path := filepath.Join(t.TempDir(), "faults.json")
@@ -29,7 +29,7 @@ func TestLoad_Valid(t *testing.T) {
 		t.Fatalf("got %d rules, want 1", len(rules))
 	}
 	r := rules[0]
-	if r.Name != "r1" || r.Latency != 250*time.Millisecond || r.AbortProbability != 0.5 {
+	if r.Name != "r1" || r.Latency != 250*time.Millisecond || !r.Abort || r.Probability != 0.5 {
 		t.Fatalf("unexpected rule: %+v", r)
 	}
 	if len(r.CIDRs) != 1 || r.CIDRs[0].String() != "10.0.0.0/8" {
@@ -63,12 +63,12 @@ func TestToRules_Validation(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok-empty", RuleDTO{Name: "ok"}, false},
-		{"ok-full", RuleDTO{Name: "ok", CIDRs: []string{"192.168.0.0/16"}, Hosts: []string{"x.com"}, Latency: "1s", AbortProbability: 1}, false},
+		{"ok-full", RuleDTO{Name: "ok", CIDRs: []string{"192.168.0.0/16"}, Hosts: []string{"x.com"}, Latency: "1s", Abort: true, Probability: 1}, false},
 		{"bad-cidr", RuleDTO{Name: "bad", CIDRs: []string{"not-a-cidr"}}, true},
 		{"bad-latency", RuleDTO{Name: "bad", Latency: "abc"}, true},
 		{"negative-latency", RuleDTO{Name: "bad", Latency: "-5s"}, true},
-		{"prob-too-high", RuleDTO{Name: "bad", AbortProbability: 1.5}, true},
-		{"prob-negative", RuleDTO{Name: "bad", AbortProbability: -0.1}, true},
+		{"prob-too-high", RuleDTO{Name: "bad", Probability: 1.5}, true},
+		{"prob-negative", RuleDTO{Name: "bad", Probability: -0.1}, true},
 		{"ok-http-status", RuleDTO{Name: "ok", HTTPStatus: 503}, false},
 		{"bad-http-status-low", RuleDTO{Name: "bad", HTTPStatus: 42}, true},
 		{"bad-http-status-high", RuleDTO{Name: "bad", HTTPStatus: 700}, true},

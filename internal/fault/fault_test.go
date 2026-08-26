@@ -71,17 +71,33 @@ func TestMatch_CombinedSelectors(t *testing.T) {
 	}
 }
 
-func TestMatch_AbortProbabilityExtremes(t *testing.T) {
-	always := NewEngine([]Rule{{Name: "kill", AbortProbability: 1.0}})
-	never := NewEngine([]Rule{{Name: "safe", AbortProbability: 0.0}})
+func TestMatch_ProbabilityExtremes(t *testing.T) {
+	always := NewEngine([]Rule{{Name: "kill", Abort: true, Probability: 1.0}})
+	never := NewEngine([]Rule{{Name: "slow", Latency: time.Second, Probability: 0.0001}})
 
-	for i := 0; i < 100; i++ {
-		if !always.Match(addrPort(t, "1.1.1.1:80"), "").Abort {
-			t.Fatal("probability 1.0 should always abort")
+	abortCount, faultCount := 0, 0
+	for i := 0; i < 200; i++ {
+		if always.Match(addrPort(t, "1.1.1.1:80"), "").Abort {
+			abortCount++
 		}
-		if never.Match(addrPort(t, "1.1.1.1:80"), "").Abort {
-			t.Fatal("probability 0.0 should never abort")
+		if never.Match(addrPort(t, "1.1.1.1:80"), "").Latency > 0 {
+			faultCount++
 		}
+	}
+	if abortCount != 200 {
+		t.Fatalf("probability 1.0 should always apply the fault, got %d/200", abortCount)
+	}
+	if faultCount > 10 {
+		t.Fatalf("probability 0.0001 should almost never apply the fault, got %d/200", faultCount)
+	}
+}
+
+func TestMatch_ZeroProbabilityMeansAlways(t *testing.T) {
+	// An unset probability (0) is treated as always, so existing single-fault
+	// rules keep applying.
+	e := NewEngine([]Rule{{Name: "always", Abort: true}})
+	if !e.Match(addrPort(t, "1.1.1.1:80"), "").Abort {
+		t.Fatal("unset probability should mean always")
 	}
 }
 

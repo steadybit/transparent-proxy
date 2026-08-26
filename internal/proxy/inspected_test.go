@@ -108,7 +108,7 @@ func TestServer_InspectedPath_SNIMatchAborts(t *testing.T) {
 	hello := captureClientHello(t, "kill.example.com")
 	echo := startEcho(t)
 
-	engine := fault.NewEngine([]fault.Rule{{Name: "kill", Hosts: []string{"kill.example.com"}, AbortProbability: 1.0}})
+	engine := fault.NewEngine([]fault.Rule{{Name: "kill", Hosts: []string{"kill.example.com"}, Abort: true}})
 	proxyAddr := serveProxy(t, &Server{Faults: engine}, echo)
 
 	conn, err := net.DialTimeout("tcp", proxyAddr.String(), 2*time.Second)
@@ -135,7 +135,7 @@ func TestServer_InspectedPath_NonMatchingSNIPassesThrough(t *testing.T) {
 
 	// The only host rule targets kill.example.com, so this connection is
 	// inspected but matches nothing and must pass through.
-	engine := fault.NewEngine([]fault.Rule{{Name: "kill", Hosts: []string{"kill.example.com"}, AbortProbability: 1.0}})
+	engine := fault.NewEngine([]fault.Rule{{Name: "kill", Hosts: []string{"kill.example.com"}, Abort: true}})
 	proxyAddr := serveProxy(t, &Server{Faults: engine}, echo)
 
 	conn, err := net.DialTimeout("tcp", proxyAddr.String(), 2*time.Second)

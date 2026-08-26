@@ -72,8 +72,8 @@ selectors match — an empty selector means "any".
 {
   "rules": [
     { "name": "slow-payments", "hosts": ["api.stripe.com"], "latency": "500ms" },
-    { "name": "flaky-db",      "cidrs": ["10.0.0.0/8"],     "abortProbability": 0.25 },
-    { "name": "kill-cdn",      "hosts": ["cdn.example.com"], "abortProbability": 1.0 }
+    { "name": "flaky-db",      "cidrs": ["10.0.0.0/8"],     "abort": true, "probability": 0.25 },
+    { "name": "kill-cdn",      "hosts": ["cdn.example.com"], "abort": true }
   ]
 }
 ```
@@ -81,7 +81,9 @@ selectors match — an empty selector means "any".
 - `cidrs` — match the original destination IP (internal targeting).
 - `hosts` — match the TLS SNI, exact or subdomain (external targeting).
 - `latency` — Go duration string, added before the upstream connect.
-- `abortProbability` — `[0,1]` chance to reset (RST) the connection.
+- `abort` — reset (RST) the connection.
+- `httpStatus` — synthesize this HTTP status (L7, cleartext HTTP).
+- `probability` — `[0,1]` chance to apply the fault per connection (`0`/unset = always).
 
 ## Build & test
 
