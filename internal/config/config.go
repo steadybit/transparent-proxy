@@ -24,7 +24,7 @@ type RuleDTO struct {
 	Name        string   `json:"name"`
 	CIDRs       []string `json:"cidrs,omitempty"`
 	Hosts       []string `json:"hosts,omitempty"`
-	Probability float64  `json:"probability,omitempty"` // 0..1 (0/unset = always)
+	Probability *float64 `json:"probability,omitempty"` // 0..1 (unset = always, explicit 0 = never)
 	Latency     string   `json:"latency,omitempty"`     // e.g. "250ms"
 	Abort       bool     `json:"abort,omitempty"`       // reset the connection
 	HTTPStatus  int      `json:"httpStatus,omitempty"`  // L7: synthesize this status (100..599)
@@ -57,10 +57,12 @@ func (f File) ToRules() ([]fault.Rule, error) {
 }
 
 func (d RuleDTO) toRule() (fault.Rule, error) {
+	// Pass the probability pointer through unchanged: nil (unset) → always,
+	// explicit 0 → never. fault.Match applies the unset default.
 	r := fault.Rule{Name: d.Name, Hosts: d.Hosts, Probability: d.Probability, Abort: d.Abort, HTTPStatus: d.HTTPStatus}
 
-	if d.Probability < 0 || d.Probability > 1 {
-		return r, fmt.Errorf("probability must be within [0,1], got %v", d.Probability)
+	if d.Probability != nil && (*d.Probability < 0 || *d.Probability > 1) {
+		return r, fmt.Errorf("probability must be within [0,1], got %v", *d.Probability)
 	}
 	if d.HTTPStatus != 0 && (d.HTTPStatus < 100 || d.HTTPStatus > 599) {
 		return r, fmt.Errorf("httpStatus must be 0 or within [100,599], got %d", d.HTTPStatus)

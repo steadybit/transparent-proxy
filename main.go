@@ -62,7 +62,7 @@ func main() {
 		faultLatency = flag.Duration("fault-latency", 0, "single fault: latency added before connecting upstream")
 		faultReset   = flag.Bool("fault-reset", false, "single fault: reset (RST) matching connections")
 		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7, cleartext HTTP)")
-		faultProb    = flag.Float64("fault-probability", 0, "single fault: probability [0,1] to apply the fault per connection (0/unset = always)")
+		faultProb    = flag.Float64("fault-probability", 1, "single fault: probability [0,1] to apply the fault per connection (default 1 = always, 0 = never)")
 		faultHosts   = flag.String("fault-hosts", "", "single fault: comma-separated host selectors (SNI/Host)")
 		faultCIDRs   = flag.String("fault-cidrs", "", "single fault: comma-separated CIDR selectors")
 	)
@@ -197,7 +197,8 @@ func buildFlagRule(latency time.Duration, reset bool, status int, probability fl
 	if status != 0 && (status < 100 || status > 599) {
 		return fault.Rule{}, false, fmt.Errorf("fault-http-status must be within [100,599], got %d", status)
 	}
-	r := fault.Rule{Name: "flag-rule", Latency: latency, Abort: reset, HTTPStatus: status, Probability: probability}
+	// The flag default is 1.0 (always); an explicit 0 means never.
+	r := fault.Rule{Name: "flag-rule", Latency: latency, Abort: reset, HTTPStatus: status, Probability: &probability}
 	for _, h := range strings.Split(hosts, ",") {
 		if h = strings.TrimSpace(h); h != "" {
 			r.Hosts = append(r.Hosts, h)

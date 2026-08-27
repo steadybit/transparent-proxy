@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+func probPtr(f float64) *float64 { return &f }
+
 func TestLoad_Valid(t *testing.T) {
 	data := `{
 	  "rules": [
@@ -29,7 +31,7 @@ func TestLoad_Valid(t *testing.T) {
 		t.Fatalf("got %d rules, want 1", len(rules))
 	}
 	r := rules[0]
-	if r.Name != "r1" || r.Latency != 250*time.Millisecond || !r.Abort || r.Probability != 0.5 {
+	if r.Name != "r1" || r.Latency != 250*time.Millisecond || !r.Abort || r.Probability == nil || *r.Probability != 0.5 {
 		t.Fatalf("unexpected rule: %+v", r)
 	}
 	if len(r.CIDRs) != 1 || r.CIDRs[0].String() != "10.0.0.0/8" {
@@ -63,12 +65,13 @@ func TestToRules_Validation(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok-empty", RuleDTO{Name: "ok"}, false},
-		{"ok-full", RuleDTO{Name: "ok", CIDRs: []string{"192.168.0.0/16"}, Hosts: []string{"x.com"}, Latency: "1s", Abort: true, Probability: 1}, false},
+		{"ok-full", RuleDTO{Name: "ok", CIDRs: []string{"192.168.0.0/16"}, Hosts: []string{"x.com"}, Latency: "1s", Abort: true, Probability: probPtr(1)}, false},
+		{"prob-zero-ok", RuleDTO{Name: "ok", Probability: probPtr(0)}, false},
 		{"bad-cidr", RuleDTO{Name: "bad", CIDRs: []string{"not-a-cidr"}}, true},
 		{"bad-latency", RuleDTO{Name: "bad", Latency: "abc"}, true},
 		{"negative-latency", RuleDTO{Name: "bad", Latency: "-5s"}, true},
-		{"prob-too-high", RuleDTO{Name: "bad", Probability: 1.5}, true},
-		{"prob-negative", RuleDTO{Name: "bad", Probability: -0.1}, true},
+		{"prob-too-high", RuleDTO{Name: "bad", Probability: probPtr(1.5)}, true},
+		{"prob-negative", RuleDTO{Name: "bad", Probability: probPtr(-0.1)}, true},
 		{"ok-http-status", RuleDTO{Name: "ok", HTTPStatus: 503}, false},
 		{"bad-http-status-low", RuleDTO{Name: "bad", HTTPStatus: 42}, true},
 		{"bad-http-status-high", RuleDTO{Name: "bad", HTTPStatus: 700}, true},

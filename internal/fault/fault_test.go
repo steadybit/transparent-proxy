@@ -72,8 +72,8 @@ func TestMatch_CombinedSelectors(t *testing.T) {
 }
 
 func TestMatch_ProbabilityExtremes(t *testing.T) {
-	always := NewEngine([]Rule{{Name: "kill", Abort: true, Probability: 1.0}})
-	never := NewEngine([]Rule{{Name: "slow", Latency: time.Second, Probability: 0.0001}})
+	always := NewEngine([]Rule{{Name: "kill", Abort: true, Probability: prob(1.0)}})
+	never := NewEngine([]Rule{{Name: "slow", Latency: time.Second, Probability: prob(0.0001)}})
 
 	abortCount, faultCount := 0, 0
 	for i := 0; i < 200; i++ {
@@ -92,14 +92,30 @@ func TestMatch_ProbabilityExtremes(t *testing.T) {
 	}
 }
 
-func TestMatch_ZeroProbabilityMeansAlways(t *testing.T) {
-	// An unset probability (0) is treated as always, so existing single-fault
-	// rules keep applying.
+func TestMatch_UnsetProbabilityMeansAlways(t *testing.T) {
+	// A nil probability is unset → always, so existing single-fault rules keep
+	// applying without specifying a probability.
 	e := NewEngine([]Rule{{Name: "always", Abort: true}})
 	if !e.Match(addrPort(t, "1.1.1.1:80"), "").Abort {
-		t.Fatal("unset probability should mean always")
+		t.Fatal("unset (nil) probability should mean always")
 	}
 }
+
+func TestMatch_ExplicitZeroProbabilityMeansNever(t *testing.T) {
+	// An explicit 0 means never — the opposite of unset.
+	e := NewEngine([]Rule{{Name: "never", Abort: true, Probability: prob(0)}})
+	for i := 0; i < 50; i++ {
+		a := e.Match(addrPort(t, "1.1.1.1:80"), "")
+		if a.Abort {
+			t.Fatal("explicit probability 0 should never apply the fault")
+		}
+		if a.Rule != "never" {
+			t.Fatalf("matched rule should still be reported, got %q", a.Rule)
+		}
+	}
+}
+
+func prob(f float64) *float64 { return &f }
 
 func TestInspectSNI(t *testing.T) {
 	// A host rule with no CIDR constraint => inspect every destination.

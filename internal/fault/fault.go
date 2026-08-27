@@ -29,9 +29,10 @@ type Rule struct {
 	Hosts []string
 
 	// Probability in [0,1] gates whether this rule's fault is applied to a given
-	// matching connection (the "affect X% of connections" knob). 0 (unset) means
-	// always (1.0); values >1 are treated as 1.0.
-	Probability float64
+	// matching connection (the "affect X% of connections" knob). A nil pointer
+	// means unset → always (1.0); an explicit 0 means never; values are used as
+	// given otherwise.
+	Probability *float64
 
 	// Latency is added before the upstream connection is established,
 	// simulating a slow-to-connect dependency.
@@ -129,9 +130,15 @@ func (e *Engine) Match(dst netip.AddrPort, identity string) Action {
 		// still returns the rule name (so it's counted) but carries no fault, so
 		// it is proxied through untouched. Top-level rand.Float64 is safe for
 		// concurrent use and independent across restarts.
-		p := r.Probability
+		//
+		// Unset (nil) means always; an explicit 0 means never; anything else is
+		// rolled. So a nil default doesn't accidentally read as "never".
+		p := 1.0
+		if r.Probability != nil {
+			p = *r.Probability
+		}
 		if p <= 0 {
-			p = 1.0
+			return Action{Rule: r.Name}
 		}
 		if p < 1.0 && rand.Float64() >= p {
 			return Action{Rule: r.Name}
