@@ -28,6 +28,9 @@ type RuleDTO struct {
 	Latency     string   `json:"latency,omitempty"`     // e.g. "250ms"
 	Abort       bool     `json:"abort,omitempty"`       // reset the connection
 	HTTPStatus  int      `json:"httpStatus,omitempty"`  // L7: synthesize this status (100..599)
+
+	HTTPBody    string            `json:"httpBody,omitempty"`    // L7: synthesized response body
+	HTTPHeaders map[string]string `json:"httpHeaders,omitempty"` // L7: added to the synthesized response
 }
 
 // Load reads and validates a rules file, returning the parsed fault rules.
@@ -59,7 +62,7 @@ func (f File) ToRules() ([]fault.Rule, error) {
 func (d RuleDTO) toRule() (fault.Rule, error) {
 	// Pass the probability pointer through unchanged: nil (unset) → always,
 	// explicit 0 → never. fault.Match applies the unset default.
-	r := fault.Rule{Name: d.Name, Hosts: d.Hosts, Probability: d.Probability, Abort: d.Abort, HTTPStatus: d.HTTPStatus}
+	r := fault.Rule{Name: d.Name, Hosts: d.Hosts, Probability: d.Probability, Abort: d.Abort, HTTPStatus: d.HTTPStatus, HTTPBody: d.HTTPBody, HTTPHeaders: d.HTTPHeaders}
 
 	if d.Probability != nil && (*d.Probability < 0 || *d.Probability > 1) {
 		return r, fmt.Errorf("probability must be within [0,1], got %v", *d.Probability)

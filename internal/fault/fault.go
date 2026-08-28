@@ -47,6 +47,13 @@ type Rule struct {
 	// cleartext HTTP (it is ignored on TLS/opaque connections). Selected by the
 	// Host header, matched with the same semantics as Hosts.
 	HTTPStatus int
+
+	// HTTPBody, if set, replaces the default synthesized response body.
+	// HTTPHeaders are added to the synthesized response (Content-Length and
+	// Connection are always set by the proxy; Content-Type defaults but can be
+	// overridden here). Both apply only alongside HTTPStatus.
+	HTTPBody    string
+	HTTPHeaders map[string]string
 }
 
 // hasL7 reports whether the rule carries an L7-only fault.
@@ -54,10 +61,12 @@ func (r Rule) hasL7() bool { return r.HTTPStatus != 0 }
 
 // Action is the decision for a single connection.
 type Action struct {
-	Rule       string
-	Latency    time.Duration
-	Abort      bool
-	HTTPStatus int
+	Rule        string
+	Latency     time.Duration
+	Abort       bool
+	HTTPStatus  int
+	HTTPBody    string
+	HTTPHeaders map[string]string
 }
 
 // Engine holds an ordered rule set. The first matching rule wins.
@@ -144,10 +153,12 @@ func (e *Engine) Match(dst netip.AddrPort, identity string) Action {
 			return Action{Rule: r.Name}
 		}
 		return Action{
-			Rule:       r.Name,
-			Latency:    r.Latency,
-			Abort:      r.Abort,
-			HTTPStatus: r.HTTPStatus,
+			Rule:        r.Name,
+			Latency:     r.Latency,
+			Abort:       r.Abort,
+			HTTPStatus:  r.HTTPStatus,
+			HTTPBody:    r.HTTPBody,
+			HTTPHeaders: r.HTTPHeaders,
 		}
 	}
 	return Action{}

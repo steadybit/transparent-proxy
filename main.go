@@ -62,10 +62,13 @@ func main() {
 		faultLatency = flag.Duration("fault-latency", 0, "single fault: latency added before connecting upstream")
 		faultReset   = flag.Bool("fault-reset", false, "single fault: reset (RST) matching connections")
 		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7, cleartext HTTP)")
+		faultBody    = flag.String("fault-http-body", "", "single fault: injected HTTP response body (L7, cleartext HTTP)")
 		faultProb    = flag.Float64("fault-probability", 1, "single fault: probability [0,1] to apply the fault per connection (default 1 = always, 0 = never)")
 		faultHosts   = flag.String("fault-hosts", "", "single fault: comma-separated host selectors (SNI/Host)")
 		faultCIDRs   = flag.String("fault-cidrs", "", "single fault: comma-separated CIDR selectors")
 	)
+	var faultHeaders stringList
+	flag.Var(&faultHeaders, "fault-http-header", "single fault: injected HTTP response header 'Key: Value' (repeatable)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(*logLevel)}))
@@ -76,7 +79,7 @@ func main() {
 		logger.Error("failed to load config", slog.Any("err", err))
 		os.Exit(1)
 	}
-	if fr, ok, ferr := buildFlagRule(*faultLatency, *faultReset, *faultStatus, *faultProb, *faultHosts, *faultCIDRs); ferr != nil {
+	if fr, ok, ferr := buildFlagRule(*faultLatency, *faultReset, *faultStatus, *faultBody, faultHeaders, *faultProb, *faultHosts, *faultCIDRs); ferr != nil {
 		logger.Error("invalid fault flags", slog.Any("err", ferr))
 		os.Exit(2)
 	} else if ok {
@@ -185,9 +188,35 @@ func loadRules(path string) ([]fault.Rule, error) {
 	return config.Load(path)
 }
 
+// stringList is a repeatable string flag (e.g. --fault-http-header used more
+// than once).
+type stringList []string
+
+func (s *stringList) String() string  { return strings.Join(*s, ", ") }
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
+// parseHeaderList turns "Key: Value" entries into a header map.
+func parseHeaderList(entries []string) (map[string]string, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	h := make(map[string]string, len(entries))
+	for _, e := range entries {
+		k, v, ok := strings.Cut(e, ":")
+		if k = strings.TrimSpace(k); !ok || k == "" {
+			return nil, fmt.Errorf("invalid header %q, want 'Key: Value'", e)
+		}
+		h[k] = strings.TrimSpace(v)
+	}
+	return h, nil
+}
+
 // buildFlagRule assembles a single fault.Rule from the --fault-* flags. ok is
 // false when no fault flag is set.
-func buildFlagRule(latency time.Duration, reset bool, status int, probability float64, hosts, cidrs string) (fault.Rule, bool, error) {
+func buildFlagRule(latency time.Duration, reset bool, status int, body string, headers []string, probability float64, hosts, cidrs string) (fault.Rule, bool, error) {
 	if latency == 0 && !reset && status == 0 {
 		return fault.Rule{}, false, nil
 	}
@@ -197,8 +226,12 @@ func buildFlagRule(latency time.Duration, reset bool, status int, probability fl
 	if status != 0 && (status < 100 || status > 599) {
 		return fault.Rule{}, false, fmt.Errorf("fault-http-status must be within [100,599], got %d", status)
 	}
+	httpHeaders, err := parseHeaderList(headers)
+	if err != nil {
+		return fault.Rule{}, false, fmt.Errorf("fault-http-header: %w", err)
+	}
 	// The flag default is 1.0 (always); an explicit 0 means never.
-	r := fault.Rule{Name: "flag-rule", Latency: latency, Abort: reset, HTTPStatus: status, Probability: &probability}
+	r := fault.Rule{Name: "flag-rule", Latency: latency, Abort: reset, HTTPStatus: status, HTTPBody: body, HTTPHeaders: httpHeaders, Probability: &probability}
 	for _, h := range strings.Split(hosts, ",") {
 		if h = strings.TrimSpace(h); h != "" {
 			r.Hosts = append(r.Hosts, h)
