@@ -228,7 +228,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	// L7: synthesize an HTTP status response without contacting the upstream.
 	// Only valid for cleartext HTTP; ignored otherwise.
 	if proto == protoHTTP && action.HTTPStatus != 0 {
-		if err := writeHTTPStatus(client, action.HTTPStatus); err != nil {
+		if err := writeHTTPResponse(client, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody); err != nil {
 			log.Debug("failed to write injected status", slog.Any("err", err))
 		}
 		s.Metrics.Proxied()

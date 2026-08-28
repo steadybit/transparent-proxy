@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/textproto"
+	"strconv"
 	"strings"
 )
 
@@ -126,14 +128,35 @@ func isHTTPMethodStart(b byte) bool {
 
 // writeHTTPStatus synthesizes a minimal HTTP/1.1 response with the given status
 // code — an injected fault that never reaches the upstream.
-func writeHTTPStatus(c net.Conn, status int) error {
+// writeHTTPResponse synthesizes a cleartext HTTP response. body, if empty,
+// falls back to a default one-liner. Caller headers are added as-is (their
+// Content-Type overrides the default); Content-Length and Connection are always
+// set by the proxy so they stay correct and the connection closes cleanly.
+func writeHTTPResponse(c net.Conn, status int, headers map[string]string, body string) error {
 	reason := http.StatusText(status)
 	if reason == "" {
 		reason = "Fault Injected"
 	}
-	body := fmt.Sprintf("%d %s (injected by steadybit transparent-proxy)\n", status, reason)
-	_, err := fmt.Fprintf(c,
-		"HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-		status, reason, len(body), body)
+	if body == "" {
+		body = fmt.Sprintf("%d %s (injected by steadybit transparent-proxy)\n", status, reason)
+	}
+
+	h := map[string]string{"Content-Type": "text/plain; charset=utf-8"}
+	for k, v := range headers {
+		h[textproto.CanonicalMIMEHeaderKey(k)] = v
+	}
+	// Proxy-owned headers: keep the framing correct regardless of caller input.
+	h["Content-Length"] = strconv.Itoa(len(body))
+	h["Connection"] = "close"
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "HTTP/1.1 %d %s\r\n", status, reason)
+	for k, v := range h {
+		fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
+	}
+	sb.WriteString("\r\n")
+	sb.WriteString(body)
+
+	_, err := c.Write([]byte(sb.String()))
 	return err
 }
