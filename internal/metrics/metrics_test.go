@@ -6,6 +6,7 @@ package metrics
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -43,8 +44,40 @@ func TestMetrics_CountersAndActiveGauge(t *testing.T) {
 		BytesToUpstream:    100,
 		BytesToClient:      250,
 	}
-	if s != want {
+	if !reflect.DeepEqual(s, want) {
 		t.Fatalf("snapshot = %+v, want %+v", s, want)
+	}
+}
+
+func TestMetrics_PerHostAndFaultCounters(t *testing.T) {
+	m := New()
+
+	// two connections to api.example.com, one faulted; one to cdn.example.com,
+	// faulted with an injected HTTP response and a latency.
+	m.MatchedHost("api.example.com")
+	m.MatchedHost("api.example.com")
+	m.FaultedHost("api.example.com")
+	m.MatchedHost("cdn.example.com")
+	m.FaultedHost("cdn.example.com")
+	m.LatencyInjected()
+	m.HTTPInjected()
+	m.MatchedHost("") // ignored
+
+	s := m.Snapshot()
+	if s.LatencyApplied != 1 || s.HTTPResponsesInjected != 1 {
+		t.Fatalf("fault counters = %+v", s)
+	}
+	if got := s.PerHost["api.example.com"]; got.Matched != 2 || got.Faulted != 1 {
+		t.Fatalf("api per-host = %+v", got)
+	}
+	if got := s.PerHost["cdn.example.com"]; got.Matched != 1 || got.Faulted != 1 {
+		t.Fatalf("cdn per-host = %+v", got)
+	}
+	if _, ok := s.PerHost[""]; ok {
+		t.Fatalf("empty host should not be recorded")
+	}
+	if hosts := s.SortedHosts(); len(hosts) != 2 || hosts[0] != "api.example.com" {
+		t.Fatalf("sorted hosts = %v", hosts)
 	}
 }
 
@@ -57,7 +90,7 @@ func TestMetrics_NilSafe(t *testing.T) {
 	m.Proxied()
 	m.UpstreamError()
 	m.AddBytes(1, 2)
-	if s := m.Snapshot(); (s != Snapshot{}) {
+	if s := m.Snapshot(); !reflect.DeepEqual(s, Snapshot{}) {
 		t.Fatalf("nil metrics should snapshot to zero, got %+v", s)
 	}
 }

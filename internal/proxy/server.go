@@ -205,9 +205,20 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	action := s.Faults.Match(dst, identity)
 	log = log.With(
 		slog.String("dst", dst.String()),
-		slog.String("identity", identity),
 		slog.String("rule", action.Rule),
 	)
+	// identity (the TLS SNI or HTTP Host) is potentially sensitive, so it is
+	// only ever logged at debug — never at the info level that ships by default
+	// — while still feeding the per-host statistics the operator sees.
+	if identity != "" {
+		log.Debug("matched dependency", slog.String("identity", identity))
+	}
+	if action.Rule != "" {
+		s.Metrics.MatchedHost(identity)
+		if action.Abort || action.Latency > 0 || action.HTTPStatus != 0 {
+			s.Metrics.FaultedHost(identity)
+		}
+	}
 
 	if action.Abort {
 		s.Metrics.Aborted()
@@ -217,6 +228,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	}
 
 	if action.Latency > 0 {
+		s.Metrics.LatencyInjected()
 		select {
 		case <-time.After(action.Latency):
 		case <-ctx.Done():
@@ -231,7 +243,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		if err := writeHTTPResponse(client, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody); err != nil {
 			log.Debug("failed to write injected status", slog.Any("err", err))
 		}
-		s.Metrics.Proxied()
+		s.Metrics.HTTPInjected()
 		log.Info("injected http status", slog.Int("status", action.HTTPStatus))
 		return
 	}

@@ -45,6 +45,11 @@ type Config struct {
 	Mark        uint32   // 0 => DefaultMark
 	HookChains  []string // 0 => ["OUTPUT"]
 	Filter      Filter
+	// SkipFlush omits the filter-table chain that resets already-ESTABLISHED
+	// flows to the target ports. By default (false) warm connection pools are
+	// reset so they re-establish through the proxy and immediately feel the
+	// fault; set it when only new connections should be affected.
+	SkipFlush bool
 }
 
 func (c Config) mark() uint32 {
@@ -116,21 +121,24 @@ func (c Config) AddScript() []string {
 	}
 	s = append(s, "COMMIT")
 
-	// filter table: reset already-ESTABLISHED flows so pools reconnect.
-	s = append(s, "*filter", fmt.Sprintf(":%s - [0:0]", flush))
-	s = append(s, fmt.Sprintf("-A %s -m mark --mark %s -j RETURN", flush, mark))
-	for _, ex := range excludes {
-		s = append(s, fmt.Sprintf("-A %s -d %s -j RETURN", flush, ex))
-	}
-	for _, in := range includes {
-		for _, p := range c.Filter.Ports {
-			s = append(s, fmt.Sprintf("-A %s -p tcp -d %s --dport %d -m conntrack --ctstate ESTABLISHED -j REJECT --reject-with tcp-reset", flush, in, p))
+	// filter table: reset already-ESTABLISHED flows so pools reconnect. Skipped
+	// when SkipFlush is set, so only new connections are affected.
+	if !c.SkipFlush {
+		s = append(s, "*filter", fmt.Sprintf(":%s - [0:0]", flush))
+		s = append(s, fmt.Sprintf("-A %s -m mark --mark %s -j RETURN", flush, mark))
+		for _, ex := range excludes {
+			s = append(s, fmt.Sprintf("-A %s -d %s -j RETURN", flush, ex))
 		}
+		for _, in := range includes {
+			for _, p := range c.Filter.Ports {
+				s = append(s, fmt.Sprintf("-A %s -p tcp -d %s --dport %d -m conntrack --ctstate ESTABLISHED -j REJECT --reject-with tcp-reset", flush, in, p))
+			}
+		}
+		for _, h := range c.hooks() {
+			s = append(s, fmt.Sprintf("-I %s -j %s", h, flush))
+		}
+		s = append(s, "COMMIT")
 	}
-	for _, h := range c.hooks() {
-		s = append(s, fmt.Sprintf("-I %s -j %s", h, flush))
-	}
-	s = append(s, "COMMIT")
 
 	return s
 }
