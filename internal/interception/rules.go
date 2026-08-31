@@ -160,10 +160,15 @@ func (c Config) DeleteCommands() [][]string {
 	}
 	cmds = append(cmds, []string{"-t", "nat", "-F", redir}, []string{"-t", "nat", "-X", redir})
 
-	for _, h := range c.hooks() {
-		cmds = append(cmds, []string{"-t", "filter", "-D", h, "-j", flush})
+	// The filter flush chain is only installed when SkipFlush is false, so only
+	// then does it need removing — otherwise these deletes always fail against a
+	// non-existent chain and add noise that can mask a genuine cleanup failure.
+	if !c.SkipFlush {
+		for _, h := range c.hooks() {
+			cmds = append(cmds, []string{"-t", "filter", "-D", h, "-j", flush})
+		}
+		cmds = append(cmds, []string{"-t", "filter", "-F", flush}, []string{"-t", "filter", "-X", flush})
 	}
-	cmds = append(cmds, []string{"-t", "filter", "-F", flush}, []string{"-t", "filter", "-X", flush})
 
 	return cmds
 }

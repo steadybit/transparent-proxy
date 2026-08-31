@@ -23,6 +23,7 @@ type Metrics struct {
 	ConnectionsProxied    atomic.Int64 // completed pass-through/forward
 	ConnectionsAborted    atomic.Int64 // reset by an abort rule
 	ConnectionsDropped    atomic.Int64 // loop guard / peek failure / self-refusal
+	ConnectionsFaulted    atomic.Int64 // connections a fault was actually applied to (once each)
 	LatencyApplied        atomic.Int64 // connections a latency fault delayed
 	HTTPResponsesInjected atomic.Int64 // connections given a synthesized HTTP response
 	UpstreamErrors        atomic.Int64 // dial failures
@@ -59,6 +60,7 @@ type Snapshot struct {
 	ConnectionsProxied    int64               `json:"connections_proxied"`
 	ConnectionsAborted    int64               `json:"connections_aborted"`
 	ConnectionsDropped    int64               `json:"connections_dropped"`
+	ConnectionsFaulted    int64               `json:"connections_faulted"`
 	LatencyApplied        int64               `json:"latency_applied"`
 	HTTPResponsesInjected int64               `json:"http_responses_injected"`
 	UpstreamErrors        int64               `json:"upstream_errors"`
@@ -88,6 +90,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		ConnectionsProxied:    m.ConnectionsProxied.Load(),
 		ConnectionsAborted:    m.ConnectionsAborted.Load(),
 		ConnectionsDropped:    m.ConnectionsDropped.Load(),
+		ConnectionsFaulted:    m.ConnectionsFaulted.Load(),
 		LatencyApplied:        m.LatencyApplied.Load(),
 		HTTPResponsesInjected: m.HTTPResponsesInjected.Load(),
 		UpstreamErrors:        m.UpstreamErrors.Load(),
@@ -147,6 +150,15 @@ func (m *Metrics) Dropped() {
 func (m *Metrics) Proxied() {
 	if m != nil {
 		m.ConnectionsProxied.Add(1)
+	}
+}
+
+// Faulted records that a fault was actually applied to a connection. Call it at
+// most once per connection (a connection can carry both latency and an injected
+// response, but is a single faulted connection).
+func (m *Metrics) Faulted() {
+	if m != nil {
+		m.ConnectionsFaulted.Add(1)
 	}
 }
 

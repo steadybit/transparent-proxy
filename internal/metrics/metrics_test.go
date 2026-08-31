@@ -57,8 +57,12 @@ func TestMetrics_PerHostAndFaultCounters(t *testing.T) {
 	m.MatchedHost("api.example.com")
 	m.MatchedHost("api.example.com")
 	m.FaultedHost("api.example.com")
+	m.Faulted()
 	m.MatchedHost("cdn.example.com")
 	m.FaultedHost("cdn.example.com")
+	m.Faulted()
+	// one connection carried both latency and an injected response, but is a
+	// single faulted connection.
 	m.LatencyInjected()
 	m.HTTPInjected()
 	m.MatchedHost("") // ignored
@@ -66,6 +70,9 @@ func TestMetrics_PerHostAndFaultCounters(t *testing.T) {
 	s := m.Snapshot()
 	if s.LatencyApplied != 1 || s.HTTPResponsesInjected != 1 {
 		t.Fatalf("fault counters = %+v", s)
+	}
+	if s.ConnectionsFaulted != 2 {
+		t.Fatalf("ConnectionsFaulted = %d, want 2 (once per faulted connection)", s.ConnectionsFaulted)
 	}
 	if got := s.PerHost["api.example.com"]; got.Matched != 2 || got.Faulted != 1 {
 		t.Fatalf("api per-host = %+v", got)
