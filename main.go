@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -40,13 +41,15 @@ import (
 
 func main() {
 	var (
-		listen      = flag.String("listen", "0.0.0.0:3128", "address to accept redirected connections on")
-		rulesPath   = flag.String("config", "", "path to a JSON fault-rules file (optional; empty = pure pass-through)")
-		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
-		dialTimeout = flag.Duration("dial-timeout", 10*time.Second, "upstream connection timeout")
-		mark        = flag.Uint("mark", uint(interception.DefaultMark), "SO_MARK stamped on upstream sockets for interception loop-protection (0 disables)")
-		metricsAddr = flag.String("metrics-addr", "", "address to serve JSON metrics on (empty disables)")
-		maxDuration = flag.Duration("max-duration", 0, "deadman: self-terminate and tear down after this long (0 disables)")
+		listen        = flag.String("listen", "0.0.0.0:3128", "address to accept redirected connections on")
+		rulesPath     = flag.String("config", "", "path to a JSON fault-rules file (optional; empty = pure pass-through)")
+		logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		dialTimeout   = flag.Duration("dial-timeout", 10*time.Second, "upstream connection timeout")
+		mark          = flag.Uint("mark", uint(interception.DefaultMark), "SO_MARK stamped on upstream sockets for interception loop-protection (0 disables)")
+		metricsAddr   = flag.String("metrics-addr", "", "address to serve JSON metrics on (empty disables)")
+		metricsStdout = flag.Duration("metrics-stdout-interval", 0, "if >0, print a JSON metrics snapshot to stdout at this interval (and once on exit)")
+		maxDuration   = flag.Duration("max-duration", 0, "deadman: self-terminate and tear down after this long (0 disables)")
+		noFlush       = flag.Bool("no-flush", false, "do not reset already-ESTABLISHED connections on start (only new connections are affected)")
 
 		prePorts = flag.String("preflight-ports", "", "comma-separated target ports to refuse-on-conflict against an existing mesh (defaults to --intercept-ports)")
 
@@ -106,11 +109,17 @@ func main() {
 	if *metricsAddr != "" {
 		serveMetrics(ctx, logger, *metricsAddr, m)
 	}
+	// Periodic metrics on stdout — the cross-namespace-friendly channel the
+	// orchestrating extension scrapes (an HTTP endpoint in a container's netns is
+	// unreachable from the extension; stdout is always captured).
+	if *metricsStdout > 0 {
+		streamMetricsToStdout(ctx, *metricsStdout, m)
+	}
 
 	// Validate the interception filter and whether self-managed mode is wanted.
 	// The port is filled in after we bind (below); 0 is fine here because this
 	// instance is only used for --revert, where the port is irrelevant.
-	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), 0)
+	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), 0, *noFlush)
 	if err != nil {
 		logger.Error("invalid interception configuration", slog.Any("err", err))
 		os.Exit(2)
@@ -155,7 +164,7 @@ func main() {
 			os.Exit(1)
 		}
 		port := uint16(ln.Addr().(*net.TCPAddr).Port)
-		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port)
+		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port, *noFlush)
 		if err != nil {
 			logger.Error("invalid interception configuration", slog.Any("err", err))
 			os.Exit(2)
@@ -192,7 +201,7 @@ func loadRules(path string) ([]fault.Rule, error) {
 // than once).
 type stringList []string
 
-func (s *stringList) String() string  { return strings.Join(*s, ", ") }
+func (s *stringList) String() string { return strings.Join(*s, ", ") }
 func (s *stringList) Set(v string) error {
 	*s = append(*s, v)
 	return nil
@@ -259,7 +268,7 @@ func (a interceptorAdapter) Revert(ctx context.Context) error { return a.cfg.Rev
 // targets the exact port the proxy bound — there is no pre-allocated port that
 // another process could steal between allocation and bind. For --revert the
 // port is irrelevant (chain names derive from the exec-id) and may be 0.
-func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyPort uint16) (supervisor.Interceptor, bool, error) {
+func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyPort uint16, noFlush bool) (supervisor.Interceptor, bool, error) {
 	if cidrs == "" && ports == "" {
 		return nil, false, nil
 	}
@@ -284,6 +293,7 @@ func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyP
 		ExecutionID: execID,
 		ProxyPort:   proxyPort,
 		Mark:        mark,
+		SkipFlush:   noFlush,
 		Filter: interception.Filter{
 			Include: include,
 			Exclude: exclude,
@@ -323,6 +333,27 @@ func serveMetrics(ctx context.Context, logger *slog.Logger, addr string, m *metr
 		}
 	}()
 	logger.Info("serving metrics", slog.String("addr", addr))
+}
+
+// streamMetricsToStdout prints a JSON metrics snapshot (one compact line) to
+// stdout every interval, plus a final line when the context is cancelled. The
+// proxy's own structured logs go to stderr, so stdout carries only these
+// snapshots and the orchestrating extension can scrape it line by line.
+func streamMetricsToStdout(ctx context.Context, interval time.Duration, m *metrics.Metrics) {
+	enc := json.NewEncoder(os.Stdout)
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				_ = enc.Encode(m.Snapshot()) // final snapshot
+				return
+			case <-t.C:
+				_ = enc.Encode(m.Snapshot())
+			}
+		}
+	}()
 }
 
 func parseCIDRs(s string) ([]netip.Prefix, error) {

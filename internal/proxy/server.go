@@ -205,11 +205,32 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	action := s.Faults.Match(dst, identity)
 	log = log.With(
 		slog.String("dst", dst.String()),
-		slog.String("identity", identity),
 		slog.String("rule", action.Rule),
 	)
+	// identity (the TLS SNI or HTTP Host) is potentially sensitive, so it is
+	// only ever logged at debug — never at the info level that ships by default
+	// — while still feeding the per-host statistics the operator sees.
+	if identity != "" {
+		log.Debug("matched dependency", slog.String("identity", identity))
+	}
+	if action.Rule != "" {
+		s.Metrics.MatchedHost(identity)
+	}
+	// faulted is recorded at the point a fault actually applies — not
+	// speculatively from the Action — so per-host and global "faulted" counts
+	// stay in step and never over-report (e.g. an HTTP rule on a TLS connection,
+	// which is forwarded untouched). It fires at most once per connection.
+	faultRecorded := false
+	markFaulted := func() {
+		if !faultRecorded {
+			faultRecorded = true
+			s.Metrics.Faulted()
+			s.Metrics.FaultedHost(identity)
+		}
+	}
 
 	if action.Abort {
+		markFaulted()
 		s.Metrics.Aborted()
 		log.Info("aborting connection (reset)")
 		reset(client)
@@ -217,6 +238,8 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	}
 
 	if action.Latency > 0 {
+		markFaulted()
+		s.Metrics.LatencyInjected()
 		select {
 		case <-time.After(action.Latency):
 		case <-ctx.Done():
@@ -228,10 +251,11 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	// L7: synthesize an HTTP status response without contacting the upstream.
 	// Only valid for cleartext HTTP; ignored otherwise.
 	if proto == protoHTTP && action.HTTPStatus != 0 {
+		markFaulted()
 		if err := writeHTTPResponse(client, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody); err != nil {
 			log.Debug("failed to write injected status", slog.Any("err", err))
 		}
-		s.Metrics.Proxied()
+		s.Metrics.HTTPInjected()
 		log.Info("injected http status", slog.Int("status", action.HTTPStatus))
 		return
 	}

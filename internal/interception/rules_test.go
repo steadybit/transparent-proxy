@@ -59,6 +59,23 @@ func TestAddScript_Structure(t *testing.T) {
 	}
 }
 
+func TestAddScript_SkipFlushOmitsFilterChain(t *testing.T) {
+	c := baseConfig(t)
+	c.SkipFlush = true
+	script := joined(c.AddScript())
+
+	// The nat REDIRECT must still be installed...
+	if !strings.Contains(script, "-A SB_TP_REDIR_execid123456 -p tcp -d 0.0.0.0/0 --dport 443 -j REDIRECT --to-ports 3128") {
+		t.Fatalf("REDIRECT missing with SkipFlush:\n%s", script)
+	}
+	// ...but the filter flush chain must be entirely absent.
+	for _, forbidden := range []string{"*filter", "SB_TP_FLUSH_execid123456", "ESTABLISHED"} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("SkipFlush script should not contain %q:\n%s", forbidden, script)
+		}
+	}
+}
+
 func TestAddScript_MarkExemptionFirst(t *testing.T) {
 	c := baseConfig(t)
 	script := c.AddScript()
