@@ -10,6 +10,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/steadybit/transparent-proxy/internal/fault"
 	"github.com/steadybit/transparent-proxy/internal/metrics"
+	"github.com/steadybit/transparent-proxy/internal/tlsinject"
 )
 
 const keepAlivePeriod = 30 * time.Second
@@ -62,6 +64,13 @@ type Server struct {
 	// Metrics, if set, records per-connection outcomes. A zero
 	// ConnectionsMatched under load is the canonical silent-no-op signal.
 	Metrics *metrics.Metrics
+
+	// TLSInject, when non-nil, enables HTTPS response injection: a matched TLS
+	// connection carrying an L7 status fault is terminated with a certificate
+	// minted for its SNI, and the synthesized response is written inside TLS.
+	// Nil (the default) means TLS is never decrypted — HTTPS connections are
+	// spliced through untouched exactly as before.
+	TLSInject *tlsinject.CA
 
 	// listenPort and localAddrs are captured at Serve time for the self-loop
 	// guard, so a redirected flow resolving back to this proxy (on loopback or
@@ -249,15 +258,48 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	}
 
 	// L7: synthesize an HTTP status response without contacting the upstream.
-	// Only valid for cleartext HTTP; ignored otherwise.
-	if proto == protoHTTP && action.HTTPStatus != 0 {
-		markFaulted()
-		if err := writeHTTPResponse(client, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody); err != nil {
-			log.Debug("failed to write injected status", slog.Any("err", err))
+	// Cleartext HTTP is written directly. HTTPS is only decrypted when a CA is
+	// configured and the client offered an SNI to mint a certificate for;
+	// otherwise the connection falls through and is spliced untouched, which is
+	// the pre-CA behaviour.
+	if action.HTTPStatus != 0 {
+		switch {
+		case proto == protoHTTP:
+			markFaulted()
+			if err := writeHTTPResponse(client, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody); err != nil {
+				log.Debug("failed to write injected status", slog.Any("err", err))
+			}
+			s.Metrics.HTTPInjected()
+			log.Info("injected http status", slog.Int("status", action.HTTPStatus))
+			return
+
+		case proto == protoTLS && s.TLSInject != nil && identity != "":
+			err := s.TLSInject.ServeForged(ctx, client, prefix, tlsinject.Response{
+				Status:  action.HTTPStatus,
+				Body:    action.HTTPBody,
+				Headers: action.HTTPHeaders,
+			}, s.peekTimeout())
+
+			var hsErr *tlsinject.HandshakeError
+			if errors.As(err, &hsErr) {
+				// The client rejected our certificate, so the fault never applied —
+				// counted separately from faults, never as one. This is the signal
+				// that the CA is missing from the workload's truststore.
+				s.Metrics.TLSHandshakeFailed()
+				log.Warn("client rejected the injected certificate; is the CA trusted by the target?",
+					slog.Any("err", err))
+				return
+			}
+			if err != nil {
+				log.Debug("failed to serve injected https response", slog.Any("err", err))
+				return
+			}
+			// Recorded only once the response was actually delivered.
+			markFaulted()
+			s.Metrics.HTTPInjected()
+			log.Info("injected https status", slog.Int("status", action.HTTPStatus))
+			return
 		}
-		s.Metrics.HTTPInjected()
-		log.Info("injected http status", slog.Int("status", action.HTTPStatus))
-		return
 	}
 
 	s.forward(ctx, log, client, dst, prefix)

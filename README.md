@@ -62,6 +62,11 @@ The hostname/SNI targeting is what makes **one** tool work for both internal
 - **Inspected path:** when a rule targets by hostname, the proxy reads only the
   first TLS record to extract the SNI (cleartext — **no MITM, no certificates**),
   replays those bytes to the upstream, then splices the remainder.
+- **Interception path (opt-in):** only when a CA is supplied via
+  `--tls-ca-cert`/`--tls-ca-key` *and* a matching rule carries `httpStatus`, an
+  HTTPS connection is terminated so the response can be synthesized. See
+  [HTTPS response injection](#https-response-injection). Without a CA the proxy
+  never decrypts anything.
 
 ## Fault rules
 
@@ -82,8 +87,52 @@ selectors match — an empty selector means "any".
 - `hosts` — match the TLS SNI, exact or subdomain (external targeting).
 - `latency` — Go duration string, added before the upstream connect.
 - `abort` — reset (RST) the connection.
-- `httpStatus` — synthesize this HTTP status (L7, cleartext HTTP).
+- `httpStatus` — synthesize this HTTP status (L7). Cleartext HTTP always; HTTPS
+  only with an interception CA (see below).
 - `probability` — `[0,1]` chance to apply the fault per connection (`0`/unset = always).
+
+## HTTPS response injection
+
+By default the proxy never decrypts TLS: it reads the SNI in cleartext and
+splices the bytes through. Supplying a CA opts in to terminating **matched**
+HTTPS connections so an `httpStatus` fault can be synthesized inside TLS:
+
+```bash
+transparent-proxy \
+  --tls-ca-cert /etc/steadybit/intercept-ca.crt \
+  --tls-ca-key  /etc/steadybit/intercept-ca.key \
+  --fault-hosts api.stripe.com --fault-http-status 503
+```
+
+The proxy mints a short-lived certificate for the connection's SNI, signed by
+that CA, and answers the request itself. **HTTP/1.1 and HTTP/2 are both
+supported** — the response is delivered over whichever the client negotiates
+via ALPN.
+
+**The CA is yours.** You generate it, choose how long it lives, and install it
+in the truststores of the workloads you want to fault. The proxy only signs with
+it; it never creates, rotates, or renews a CA. A CA already outside its validity
+window is rejected at startup rather than failing every handshake later.
+
+This is deliberately **one-sided**: the real dependency is never contacted. The
+proxy makes no trust decision about the origin's certificate, and a dependency
+behind mutual TLS is unaffected. The trade-off is that the response is
+fabricated rather than a modified real one.
+
+**When it does not apply** — the connection is spliced through untouched:
+
+- no CA configured, or the client sent no SNI;
+- the rule carries no `httpStatus`;
+- the connection lost the `probability` roll.
+
+**When the client refuses** — if the workload does not trust the CA (or pins
+certificates), the handshake fails. That is counted as `tls_handshake_failures`
+and is deliberately *not* counted as a fault, so a non-zero value is the signal
+that the CA is missing from the target's truststore rather than a silent no-op.
+
+> Interception requires a key that can impersonate any HTTPS endpoint to
+> anything trusting the CA. Treat it as a test/staging capability and keep the
+> key restricted.
 
 ## Build & test
 

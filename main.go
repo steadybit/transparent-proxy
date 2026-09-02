@@ -37,6 +37,7 @@ import (
 	"github.com/steadybit/transparent-proxy/internal/preflight"
 	"github.com/steadybit/transparent-proxy/internal/proxy"
 	"github.com/steadybit/transparent-proxy/internal/supervisor"
+	"github.com/steadybit/transparent-proxy/internal/tlsinject"
 )
 
 func main() {
@@ -59,6 +60,12 @@ func main() {
 		execID         = flag.String("exec-id", "default", "execution id used to name the interception chains")
 
 		revert = flag.Bool("revert", false, "remove the interception rules for the given --exec-id/--intercept-* and exit (out-of-band teardown, idempotent)")
+
+		// HTTPS response injection. The CA is supplied by the customer, who owns
+		// its validity and installs it in their workloads' truststores; the proxy
+		// only signs per-SNI leaves with it. Unset = TLS is never decrypted.
+		tlsCACert = flag.String("tls-ca-cert", "", "PEM CA certificate used to mint per-SNI certificates, enabling HTTPS response injection (requires --tls-ca-key)")
+		tlsCAKey  = flag.String("tls-ca-key", "", "PEM private key matching --tls-ca-cert")
 
 		// Single-rule fault flags — a convenience for orchestrators that inject
 		// one fault, avoiding a JSON --config file. Appended to any --config rules.
@@ -92,6 +99,16 @@ func main() {
 		logger.Info("loaded fault rules", slog.Int("count", len(rules)))
 	}
 
+	injector, err := loadInterceptCA(*tlsCACert, *tlsCAKey)
+	if err != nil {
+		logger.Error("invalid TLS interception CA", slog.Any("err", err))
+		os.Exit(2)
+	}
+	if injector != nil {
+		logger.Info("HTTPS response injection enabled",
+			slog.Time("ca_not_after", injector.NotAfter()))
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -103,6 +120,7 @@ func main() {
 		DialTimeout: *dialTimeout,
 		Mark:        uint32(*mark),
 		Metrics:     m,
+		TLSInject:   injector,
 	}
 
 	// The metrics endpoint runs for the whole process lifetime.
@@ -195,6 +213,31 @@ func loadRules(path string) ([]fault.Rule, error) {
 		return nil, nil
 	}
 	return config.Load(path)
+}
+
+// loadInterceptCA loads the optional HTTPS-interception CA. Returning (nil, nil)
+// means the feature is off and TLS is never decrypted.
+//
+// The customer owns this CA — they generate it, choose how long it lives, and
+// install it in the truststores of the workloads they want to fault. The only
+// lifecycle judgement made here is refusing one that is already outside its
+// validity window, because it would otherwise fail every handshake with a far
+// less obvious error.
+func loadInterceptCA(certPath, keyPath string) (*tlsinject.CA, error) {
+	if certPath == "" && keyPath == "" {
+		return nil, nil
+	}
+	if certPath == "" || keyPath == "" {
+		return nil, errors.New("--tls-ca-cert and --tls-ca-key must be set together")
+	}
+	ca, err := tlsinject.LoadCAFromFiles(certPath, keyPath)
+	if err != nil {
+		return nil, err
+	}
+	if ca.Expired(time.Now()) {
+		return nil, fmt.Errorf("CA is outside its validity window (not after %s); issue a new one", ca.NotAfter().Format(time.RFC3339))
+	}
+	return ca, nil
 }
 
 // stringList is a repeatable string flag (e.g. --fault-http-header used more

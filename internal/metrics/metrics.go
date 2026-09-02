@@ -26,6 +26,7 @@ type Metrics struct {
 	ConnectionsFaulted    atomic.Int64 // connections a fault was actually applied to (once each)
 	LatencyApplied        atomic.Int64 // connections a latency fault delayed
 	HTTPResponsesInjected atomic.Int64 // connections given a synthesized HTTP response
+	TLSHandshakeFailures  atomic.Int64 // HTTPS interception rejected by the client (CA not trusted / pinning)
 	UpstreamErrors        atomic.Int64 // dial failures
 	BytesToUpstream       atomic.Int64
 	BytesToClient         atomic.Int64
@@ -63,6 +64,7 @@ type Snapshot struct {
 	ConnectionsFaulted    int64               `json:"connections_faulted"`
 	LatencyApplied        int64               `json:"latency_applied"`
 	HTTPResponsesInjected int64               `json:"http_responses_injected"`
+	TLSHandshakeFailures  int64               `json:"tls_handshake_failures"`
 	UpstreamErrors        int64               `json:"upstream_errors"`
 	BytesToUpstream       int64               `json:"bytes_to_upstream"`
 	BytesToClient         int64               `json:"bytes_to_client"`
@@ -93,6 +95,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		ConnectionsFaulted:    m.ConnectionsFaulted.Load(),
 		LatencyApplied:        m.LatencyApplied.Load(),
 		HTTPResponsesInjected: m.HTTPResponsesInjected.Load(),
+		TLSHandshakeFailures:  m.TLSHandshakeFailures.Load(),
 		UpstreamErrors:        m.UpstreamErrors.Load(),
 		BytesToUpstream:       m.BytesToUpstream.Load(),
 		BytesToClient:         m.BytesToClient.Load(),
@@ -174,6 +177,16 @@ func (m *Metrics) LatencyInjected() {
 func (m *Metrics) HTTPInjected() {
 	if m != nil {
 		m.HTTPResponsesInjected.Add(1)
+	}
+}
+
+// TLSHandshakeFailed records an HTTPS connection the client refused to complete
+// a handshake on. A non-zero count is the canonical "our CA is not trusted by
+// the target (or the client pins certificates)" signal — the fault could not be
+// applied, so it is deliberately not counted as faulted.
+func (m *Metrics) TLSHandshakeFailed() {
+	if m != nil {
+		m.TLSHandshakeFailures.Add(1)
 	}
 }
 
