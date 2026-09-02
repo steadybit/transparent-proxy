@@ -157,9 +157,43 @@ func Test_ServeForged_untrustedClientYieldsHandshakeError(t *testing.T) {
 	}
 
 	err := waitServed(t, ch)
-	var hs *HandshakeError
-	if !errors.As(err, &hs) {
-		t.Fatalf("err = %v, want a *HandshakeError", err)
+	var rej *RejectedError
+	if !errors.As(err, &rej) {
+		t.Fatalf("err = %v, want a *RejectedError", err)
+	}
+}
+
+// Under TLS 1.3 the server's handshake completes before the client reports that
+// it dislikes the certificate — the client simply walks away without sending a
+// request. Observed with curl/OpenSSL against a real proxy, where it made a
+// rejected connection look like a successfully injected fault. A completed
+// handshake is therefore not proof of delivery; an actual response is.
+func Test_ServeForged_rejectedAfterHandshakeIsNotDelivery(t *testing.T) {
+	ca, caPEM := mustLoadTestCA(t)
+	addr, ch := serveForgedOnce(t, ca, Response{Status: 503})
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEM)
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
+		RootCAs: pool, ServerName: testSNI, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	// Complete the handshake, then leave without a request — exactly what a
+	// client that refuses the certificate does.
+	if err := conn.Handshake(); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	_ = conn.Close()
+
+	err = waitServed(t, ch)
+	var rej *RejectedError
+	if !errors.As(err, &rej) {
+		t.Fatalf("err = %v, want a *RejectedError (nothing was ever delivered)", err)
+	}
+	if rej.Stage != "post-handshake" {
+		t.Fatalf("stage = %q, want post-handshake", rej.Stage)
 	}
 }
 

@@ -26,7 +26,7 @@ type Metrics struct {
 	ConnectionsFaulted    atomic.Int64 // connections a fault was actually applied to (once each)
 	LatencyApplied        atomic.Int64 // connections a latency fault delayed
 	HTTPResponsesInjected atomic.Int64 // connections given a synthesized HTTP response
-	TLSHandshakeFailures  atomic.Int64 // HTTPS interception rejected by the client (CA not trusted / pinning)
+	TLSInterceptRejected  atomic.Int64 // HTTPS interception rejected by the client (CA not trusted / pinning)
 	UpstreamErrors        atomic.Int64 // dial failures
 	BytesToUpstream       atomic.Int64
 	BytesToClient         atomic.Int64
@@ -64,7 +64,7 @@ type Snapshot struct {
 	ConnectionsFaulted    int64               `json:"connections_faulted"`
 	LatencyApplied        int64               `json:"latency_applied"`
 	HTTPResponsesInjected int64               `json:"http_responses_injected"`
-	TLSHandshakeFailures  int64               `json:"tls_handshake_failures"`
+	TLSInterceptRejected  int64               `json:"tls_intercept_rejected"`
 	UpstreamErrors        int64               `json:"upstream_errors"`
 	BytesToUpstream       int64               `json:"bytes_to_upstream"`
 	BytesToClient         int64               `json:"bytes_to_client"`
@@ -95,7 +95,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		ConnectionsFaulted:    m.ConnectionsFaulted.Load(),
 		LatencyApplied:        m.LatencyApplied.Load(),
 		HTTPResponsesInjected: m.HTTPResponsesInjected.Load(),
-		TLSHandshakeFailures:  m.TLSHandshakeFailures.Load(),
+		TLSInterceptRejected:  m.TLSInterceptRejected.Load(),
 		UpstreamErrors:        m.UpstreamErrors.Load(),
 		BytesToUpstream:       m.BytesToUpstream.Load(),
 		BytesToClient:         m.BytesToClient.Load(),
@@ -180,13 +180,16 @@ func (m *Metrics) HTTPInjected() {
 	}
 }
 
-// TLSHandshakeFailed records an HTTPS connection the client refused to complete
-// a handshake on. A non-zero count is the canonical "our CA is not trusted by
-// the target (or the client pins certificates)" signal — the fault could not be
-// applied, so it is deliberately not counted as faulted.
-func (m *Metrics) TLSHandshakeFailed() {
+// TLSRejected records an HTTPS connection on which the client refused the
+// injected certificate — either by failing the handshake, or (under TLS 1.3,
+// where the server's handshake completes before the client's verdict arrives)
+// by abandoning the connection without ever sending a request. A non-zero count
+// is the canonical "our CA is not trusted by the target, or the client pins
+// certificates" signal. In both cases no response was delivered, so it is
+// deliberately not counted as faulted.
+func (m *Metrics) TLSRejected() {
 	if m != nil {
-		m.TLSHandshakeFailures.Add(1)
+		m.TLSInterceptRejected.Add(1)
 	}
 }
 

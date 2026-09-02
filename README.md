@@ -126,7 +126,7 @@ fabricated rather than a modified real one.
 - the connection lost the `probability` roll.
 
 **When the client refuses** — if the workload does not trust the CA (or pins
-certificates), the handshake fails. That is counted as `tls_handshake_failures`
+certificates), the handshake fails. That is counted as `tls_intercept_rejected`
 and is deliberately *not* counted as a fault, so a non-zero value is the signal
 that the CA is missing from the target's truststore rather than a silent no-op.
 

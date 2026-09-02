@@ -161,8 +161,8 @@ func TestServer_TLSInject_ForgesResponse(t *testing.T) {
 	if snap.ConnectionsFaulted != 1 {
 		t.Fatalf("ConnectionsFaulted = %d, want 1", snap.ConnectionsFaulted)
 	}
-	if snap.TLSHandshakeFailures != 0 {
-		t.Fatalf("TLSHandshakeFailures = %d, want 0", snap.TLSHandshakeFailures)
+	if snap.TLSInterceptRejected != 0 {
+		t.Fatalf("TLSInterceptRejected = %d, want 0", snap.TLSInterceptRejected)
 	}
 	if got := snap.PerHost[upstreamHost]; got.Faulted != 1 {
 		t.Fatalf("per-host faulted = %d, want 1", got.Faulted)
@@ -209,7 +209,7 @@ func TestServer_TLSInject_UntrustedClientIsCounted(t *testing.T) {
 		t.Fatal("expected the client to reject the injected certificate")
 	}
 
-	waitFor(t, func() bool { return m.Snapshot().TLSHandshakeFailures == 1 }, "a counted handshake failure")
+	waitFor(t, func() bool { return m.Snapshot().TLSInterceptRejected == 1 }, "a counted handshake failure")
 	snap := m.Snapshot()
 	if snap.ConnectionsFaulted != 0 {
 		t.Fatalf("ConnectionsFaulted = %d, want 0 — the fault never applied", snap.ConnectionsFaulted)

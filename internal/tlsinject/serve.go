@@ -16,6 +16,7 @@ import (
 	"net/textproto"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,17 +40,32 @@ type Response struct {
 	Headers map[string]string
 }
 
-// HandshakeError marks a failure to complete the TLS handshake with the client.
-// In practice this means the minted certificate was rejected: the CA is not in
-// the workload's truststore, or the client pins certificates. It is a distinct
-// type so the caller can count it and surface that diagnosis rather than
-// reporting a silent no-op.
-type HandshakeError struct{ Err error }
-
-func (e *HandshakeError) Error() string {
-	return "tls handshake with client failed: " + e.Err.Error()
+// RejectedError reports that the client refused the injected certificate —
+// almost always because the CA is absent from the workload's truststore, or
+// because the client pins certificates.
+//
+// It covers two stages, because refusal is not always visible at handshake
+// time. Under TLS 1.2 the handshake itself fails. Under TLS 1.3 the server
+// completes its handshake before learning the client's verdict, so a rejecting
+// client (OpenSSL/curl among them) instead abandons the connection without ever
+// sending a request. Both mean the fault was never delivered, so both are
+// reported here rather than counted as a successful injection.
+type RejectedError struct {
+	// Stage is "handshake" or "post-handshake".
+	Stage string
+	// Err is the underlying failure; nil when the client simply went away
+	// without sending a request.
+	Err error
 }
-func (e *HandshakeError) Unwrap() error { return e.Err }
+
+func (e *RejectedError) Error() string {
+	msg := "client rejected the injected certificate (" + e.Stage + ")"
+	if e.Err != nil {
+		return msg + ": " + e.Err.Error()
+	}
+	return msg + ": no request was sent"
+}
+func (e *RejectedError) Unwrap() error { return e.Err }
 
 // ServeForged terminates TLS on conn using a certificate minted for the
 // client's SNI, then answers the request with r and closes. clientHello replays
@@ -65,7 +81,7 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 	if err := tc.HandshakeContext(hctx); err != nil {
-		return &HandshakeError{Err: err}
+		return &RejectedError{Stage: "handshake", Err: err}
 	}
 
 	// Cancellation must reach a connection parked inside net/http; closing it is
@@ -80,7 +96,21 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 		}
 	}()
 
-	return serveOne(tc, r)
+	// delivered is the only trustworthy proof the fault landed: a completed
+	// handshake is not one, because a TLS 1.3 client reports a certificate it
+	// dislikes only by walking away afterwards.
+	var delivered atomic.Bool
+	if err := serveOne(tc, r, &delivered); err != nil {
+		return err
+	}
+	if delivered.Load() {
+		return nil
+	}
+	if ctx.Err() != nil {
+		// Torn down mid-connection: not the client's doing.
+		return nil
+	}
+	return &RejectedError{Stage: "post-handshake"}
 }
 
 // serveOne runs net/http over a single already-handshaken connection. Handing
@@ -88,10 +118,10 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 // HTTP/2 support for free: a TLSConfig advertising h2 makes Serve install the
 // stdlib's HTTP/2 handler, and net/http then dispatches on the protocol ALPN
 // negotiated during the handshake above.
-func serveOne(tc *tls.Conn, r Response) error {
+func serveOne(tc *tls.Conn, r Response, delivered *atomic.Bool) error {
 	ln := newOneShotListener(tc)
 	srv := &http.Server{
-		Handler:           r.handler(),
+		Handler:           r.handler(delivered),
 		ReadHeaderTimeout: readHeaderTimeout,
 		// A TLSConfig advertising h2 is what makes Serve install the stdlib's
 		// HTTP/2 handler. net/http then picks the protocol by type-asserting the
@@ -118,7 +148,7 @@ func serveOne(tc *tls.Conn, r Response) error {
 
 // handler writes the forged response. It is shared by the HTTP/1.1 and HTTP/2
 // paths, so both produce an identical status, header set and body.
-func (r Response) handler() http.Handler {
+func (r Response) handler(delivered *atomic.Bool) http.Handler {
 	body := r.resolvedBody()
 	status := r.resolvedStatus()
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -141,6 +171,7 @@ func (r Response) handler() http.Handler {
 		}
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, body)
+		delivered.Store(true)
 	})
 }
 

@@ -280,13 +280,14 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 				Headers: action.HTTPHeaders,
 			}, s.peekTimeout())
 
-			var hsErr *tlsinject.HandshakeError
-			if errors.As(err, &hsErr) {
+			var rejErr *tlsinject.RejectedError
+			if errors.As(err, &rejErr) {
 				// The client rejected our certificate, so the fault never applied —
 				// counted separately from faults, never as one. This is the signal
 				// that the CA is missing from the workload's truststore.
-				s.Metrics.TLSHandshakeFailed()
+				s.Metrics.TLSRejected()
 				log.Warn("client rejected the injected certificate; is the CA trusted by the target?",
+					slog.String("stage", rejErr.Stage),
 					slog.Any("err", err))
 				return
 			}
