@@ -200,3 +200,35 @@ func Test_ServerTLSConfig_requiresSNI(t *testing.T) {
 		}
 	}
 }
+
+func Test_LoadCACombined(t *testing.T) {
+	certPEM, keyPEM := newTestCAPEM(t, time.Now().Add(24*time.Hour), true)
+
+	// Order must not matter: an orchestrator concatenates whichever way round.
+	for _, combined := range [][]byte{
+		append(append([]byte{}, certPEM...), keyPEM...),
+		append(append([]byte{}, keyPEM...), certPEM...),
+	} {
+		ca, err := LoadCACombined(combined)
+		if err != nil {
+			t.Fatalf("LoadCACombined: %v", err)
+		}
+		if _, err := ca.leafFor("api.anthropic.com"); err != nil {
+			t.Fatalf("minting from a combined PEM failed: %v", err)
+		}
+	}
+
+	// A stream missing either half is rejected with a pointed message rather
+	// than failing later on every handshake.
+	if _, err := LoadCACombined(certPEM); err == nil ||
+		!strings.Contains(err.Error(), "PRIVATE KEY") {
+		t.Fatalf("expected a missing-key error, got %v", err)
+	}
+	if _, err := LoadCACombined(keyPEM); err == nil ||
+		!strings.Contains(err.Error(), "CERTIFICATE") {
+		t.Fatalf("expected a missing-certificate error, got %v", err)
+	}
+	if _, err := LoadCACombined([]byte("not pem at all")); err == nil {
+		t.Fatal("expected garbage to be rejected")
+	}
+}

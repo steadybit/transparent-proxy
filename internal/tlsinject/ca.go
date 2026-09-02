@@ -27,11 +27,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -93,6 +95,40 @@ func LoadCA(certPEM, keyPEM []byte) (*CA, error) {
 		return nil, fmt.Errorf("failed to generate leaf key: %w", err)
 	}
 	return &CA{cert: cert, key: signer, leafKey: leafKey, cache: map[string]*tls.Certificate{}}, nil
+}
+
+// LoadCACombined parses one PEM stream carrying both the CA certificate and its
+// private key, in any order.
+//
+// This is the form the proxy accepts on stdin, which is how an orchestrator
+// hands over the key without writing it to a disk the target could reach or
+// exposing it on the command line. It also sidesteps a filesystem asymmetry:
+// the proxy may run inside an overlay of the orchestrator's root, and an
+// overlay does not carry the orchestrator's submounts — so a key mounted there
+// (a Kubernetes Secret, say) would simply not be visible by path.
+func LoadCACombined(pemBytes []byte) (*CA, error) {
+	var certPEM, keyPEM []byte
+	rest := pemBytes
+	for {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		switch {
+		case blk.Type == "CERTIFICATE":
+			certPEM = append(certPEM, pem.EncodeToMemory(blk)...)
+		case strings.Contains(blk.Type, "PRIVATE KEY"):
+			keyPEM = append(keyPEM, pem.EncodeToMemory(blk)...)
+		}
+	}
+	if len(certPEM) == 0 {
+		return nil, errors.New("no CERTIFICATE block in the supplied PEM")
+	}
+	if len(keyPEM) == 0 {
+		return nil, errors.New("no PRIVATE KEY block in the supplied PEM")
+	}
+	return LoadCA(certPEM, keyPEM)
 }
 
 // LoadCAFromFiles reads a PEM certificate and key from disk.

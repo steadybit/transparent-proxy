@@ -19,6 +19,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -64,8 +65,9 @@ func main() {
 		// HTTPS response injection. The CA is supplied by the customer, who owns
 		// its validity and installs it in their workloads' truststores; the proxy
 		// only signs per-SNI leaves with it. Unset = TLS is never decrypted.
-		tlsCACert = flag.String("tls-ca-cert", "", "PEM CA certificate used to mint per-SNI certificates, enabling HTTPS response injection (requires --tls-ca-key)")
-		tlsCAKey  = flag.String("tls-ca-key", "", "PEM private key matching --tls-ca-cert")
+		tlsCACert  = flag.String("tls-ca-cert", "", "PEM CA certificate used to mint per-SNI certificates, enabling HTTPS response injection (requires --tls-ca-key)")
+		tlsCAKey   = flag.String("tls-ca-key", "", "PEM private key matching --tls-ca-cert")
+		tlsCAStdin = flag.Bool("tls-ca-stdin", false, "read the interception CA (certificate and private key, one PEM stream) from stdin instead of from files")
 
 		// Single-rule fault flags — a convenience for orchestrators that inject
 		// one fault, avoiding a JSON --config file. Appended to any --config rules.
@@ -153,7 +155,7 @@ func main() {
 	// --revert, by which time the CA files may be gone or expired — refusing to
 	// start there would leave the interception rules installed, breaking the
 	// guaranteed-cleanup contract.
-	injector, err := loadInterceptCA(*tlsCACert, *tlsCAKey)
+	injector, err := loadInterceptCA(*tlsCACert, *tlsCAKey, *tlsCAStdin)
 	if err != nil {
 		logger.Error("invalid TLS interception CA", slog.Any("err", err))
 		os.Exit(2)
@@ -228,14 +230,32 @@ func loadRules(path string) ([]fault.Rule, error) {
 // lifecycle judgement made here is refusing one that is already outside its
 // validity window, because it would otherwise fail every handshake with a far
 // less obvious error.
-func loadInterceptCA(certPath, keyPath string) (*tlsinject.CA, error) {
-	if certPath == "" && keyPath == "" {
+func loadInterceptCA(certPath, keyPath string, fromStdin bool) (*tlsinject.CA, error) {
+	var (
+		ca  *tlsinject.CA
+		err error
+	)
+	switch {
+	case fromStdin && (certPath != "" || keyPath != ""):
+		return nil, errors.New("--tls-ca-stdin cannot be combined with --tls-ca-cert/--tls-ca-key")
+	case fromStdin:
+		// Reading the key from stdin keeps it off the command line and off any
+		// filesystem the target could reach. It is also the only channel that
+		// works uniformly: the proxy may run inside an overlay of the
+		// orchestrator's root, which does not carry the orchestrator's submounts,
+		// so a key mounted there is invisible by path.
+		pemBytes, rerr := io.ReadAll(os.Stdin)
+		if rerr != nil {
+			return nil, fmt.Errorf("failed to read CA from stdin: %w", rerr)
+		}
+		ca, err = tlsinject.LoadCACombined(pemBytes)
+	case certPath == "" && keyPath == "":
 		return nil, nil
-	}
-	if certPath == "" || keyPath == "" {
+	case certPath == "" || keyPath == "":
 		return nil, errors.New("--tls-ca-cert and --tls-ca-key must be set together")
+	default:
+		ca, err = tlsinject.LoadCAFromFiles(certPath, keyPath)
 	}
-	ca, err := tlsinject.LoadCAFromFiles(certPath, keyPath)
 	if err != nil {
 		return nil, err
 	}
