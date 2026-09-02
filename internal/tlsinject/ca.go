@@ -42,6 +42,9 @@ const (
 	leafValidity = 24 * time.Hour
 	// leafBackdate tolerates modest clock skew between the proxy and the client.
 	leafBackdate = 1 * time.Hour
+	// leafRenewBefore re-mints a cached leaf this long before it expires, so a
+	// long-running proxy never serves an expired certificate.
+	leafRenewBefore = 1 * time.Hour
 	// maxCachedLeaves bounds the per-SNI cache so traffic to a great many
 	// hostnames cannot grow it without limit. Beyond the cap certificates are
 	// still minted, just not retained.
@@ -124,8 +127,11 @@ func (c *CA) ServerTLSConfig() *tls.Config {
 		NextProtos: []string{"h2", "http/1.1"},
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			if hello.ServerName == "" {
-				// Without SNI there is no name to impersonate. Failing here aborts
-				// the handshake; the caller forwards such connections instead.
+				// Without SNI there is no name to impersonate, so the handshake is
+				// aborted. There is no falling back to forwarding at this point: the
+				// ClientHello has been consumed and TLS records already written.
+				// Callers avoid reaching here by only interception connections whose
+				// SNI they already read.
 				return nil, errors.New("client sent no SNI; cannot mint a certificate")
 			}
 			return c.leafFor(hello.ServerName)
@@ -133,10 +139,15 @@ func (c *CA) ServerTLSConfig() *tls.Config {
 	}
 }
 
-// leafFor returns a cached certificate for host, minting one on first use.
+// leafFor returns a cached certificate for host, minting one on first use and
+// re-minting before the cached one expires. Without the expiry check a proxy
+// outliving leafValidity would serve an expired certificate for every hostname
+// it had ever seen, and every client would reject it — indistinguishable, from
+// the operator's side, from the CA not being trusted.
 func (c *CA) leafFor(host string) (*tls.Certificate, error) {
+	now := time.Now()
 	c.mu.Lock()
-	if cert, ok := c.cache[host]; ok {
+	if cert, ok := c.cache[host]; ok && now.Before(cert.Leaf.NotAfter.Add(-leafRenewBefore)) {
 		c.mu.Unlock()
 		return cert, nil
 	}
@@ -150,11 +161,14 @@ func (c *CA) leafFor(host string) (*tls.Certificate, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// Another goroutine may have minted the same host concurrently; prefer the
-	// stored one so every caller for a host shares a single certificate.
-	if existing, ok := c.cache[host]; ok {
+	// stored one so every caller for a host shares a single certificate — unless
+	// it is the stale one we set out to replace.
+	if existing, ok := c.cache[host]; ok && now.Before(existing.Leaf.NotAfter.Add(-leafRenewBefore)) {
 		return existing, nil
 	}
-	if len(c.cache) < maxCachedLeaves {
+	// Replacing an existing (stale) entry never grows the map, so the cap only
+	// gates genuinely new hostnames.
+	if _, replacing := c.cache[host]; replacing || len(c.cache) < maxCachedLeaves {
 		c.cache[host] = cert
 	}
 	return cert, nil
@@ -171,6 +185,13 @@ func (c *CA) mint(host string) (*tls.Certificate, error) {
 	// A leaf must never outlive the CA that signed it.
 	if notAfter.After(c.cert.NotAfter) {
 		notAfter = c.cert.NotAfter
+	}
+	// The CA expiring mid-run is only caught here — the startup check cannot see
+	// it. Minting a certificate that is already expired would surface to the
+	// operator as "the client rejected us", pointing at the truststore instead of
+	// at the real cause.
+	if !notAfter.After(now) {
+		return nil, fmt.Errorf("CA expired at %s; cannot mint a certificate for %q", c.cert.NotAfter.Format(time.RFC3339), host)
 	}
 
 	tmpl := &x509.Certificate{

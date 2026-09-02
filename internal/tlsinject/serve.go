@@ -67,21 +67,51 @@ func (e *RejectedError) Error() string {
 }
 func (e *RejectedError) Unwrap() error { return e.Err }
 
+// Request is one interception: what to answer with, and how to report it.
+type Request struct {
+	Response         Response
+	HandshakeTimeout time.Duration
+	// OnDelivered is invoked the moment the first forged response is written,
+	// at most once per connection.
+	//
+	// Delivery must be reported from here rather than inferred from ServeForged
+	// returning: an HTTP/2 client pools the connection for the whole attack, so
+	// waiting for the connection to end would leave a fault that is demonstrably
+	// in effect counted as "matched but never faulted" — the proxy's canonical
+	// silent-no-op signature.
+	OnDelivered func()
+}
+
 // ServeForged terminates TLS on conn using a certificate minted for the
-// client's SNI, then answers the request with r and closes. clientHello replays
+// client's SNI, then answers requests with req.Response. clientHello replays
 // the bytes already consumed while sniffing the SNI, so the handshake sees the
 // original stream; pass nil when nothing was consumed.
 //
 // It blocks until the connection is finished — for HTTP/1.1 that is one
 // request, for HTTP/2 until the client goes away — or until ctx is cancelled,
 // which closes the connection so an attack teardown never leaks a goroutine.
-func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte, r Response, handshakeTimeout time.Duration) error {
+//
+// A nil return means the connection ended without the client refusing us; it is
+// not a claim that anything was delivered. Use OnDelivered for that.
+func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte, req Request) error {
 	tc := tls.Server(replayConn(conn, clientHello), c.ServerTLSConfig())
 
-	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	hctx, cancel := context.WithTimeout(ctx, req.HandshakeTimeout)
 	defer cancel()
 	if err := tc.HandshakeContext(hctx); err != nil {
-		return &RejectedError{Stage: "handshake", Err: err}
+		switch {
+		case ctx.Err() != nil:
+			// Teardown closed the connection mid-handshake; not the client's doing,
+			// and must not be blamed on the truststore.
+			return nil
+		case errors.Is(err, context.DeadlineExceeded):
+			// Our own deadline elapsed. A slow client or a loaded proxy is not a
+			// rejection, and reporting it as one sends the operator hunting for a
+			// truststore problem that does not exist.
+			return fmt.Errorf("tls handshake did not complete within %s: %w", req.HandshakeTimeout, err)
+		default:
+			return &RejectedError{Stage: "handshake", Err: err}
+		}
 	}
 
 	// Cancellation must reach a connection parked inside net/http; closing it is
@@ -100,7 +130,7 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 	// handshake is not one, because a TLS 1.3 client reports a certificate it
 	// dislikes only by walking away afterwards.
 	var delivered atomic.Bool
-	if err := serveOne(tc, r, &delivered); err != nil {
+	if err := serveOne(tc, req, &delivered); err != nil {
 		return err
 	}
 	if delivered.Load() {
@@ -118,10 +148,10 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 // HTTP/2 support for free: a TLSConfig advertising h2 makes Serve install the
 // stdlib's HTTP/2 handler, and net/http then dispatches on the protocol ALPN
 // negotiated during the handshake above.
-func serveOne(tc *tls.Conn, r Response, delivered *atomic.Bool) error {
+func serveOne(tc *tls.Conn, req Request, delivered *atomic.Bool) error {
 	ln := newOneShotListener(tc)
 	srv := &http.Server{
-		Handler:           r.handler(delivered),
+		Handler:           req.handler(delivered),
 		ReadHeaderTimeout: readHeaderTimeout,
 		// A TLSConfig advertising h2 is what makes Serve install the stdlib's
 		// HTTP/2 handler. net/http then picks the protocol by type-asserting the
@@ -148,9 +178,15 @@ func serveOne(tc *tls.Conn, r Response, delivered *atomic.Bool) error {
 
 // handler writes the forged response. It is shared by the HTTP/1.1 and HTTP/2
 // paths, so both produce an identical status, header set and body.
-func (r Response) handler(delivered *atomic.Bool) http.Handler {
-	body := r.resolvedBody()
+func (q Request) handler(delivered *atomic.Bool) http.Handler {
+	r := q.Response
 	status := r.resolvedStatus()
+	body := r.resolvedBody()
+	// 204 and 304 must not carry a body; net/http would strip it and the
+	// advertised Content-Length would be a lie.
+	if status == http.StatusNoContent || status == http.StatusNotModified {
+		body = ""
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		h := w.Header()
 		h.Set("Content-Type", "text/plain; charset=utf-8")
@@ -160,7 +196,9 @@ func (r Response) handler(delivered *atomic.Bool) http.Handler {
 		for _, k := range hopByHop {
 			h.Del(k)
 		}
-		h.Set("Content-Length", strconv.Itoa(len(body)))
+		if body != "" {
+			h.Set("Content-Length", strconv.Itoa(len(body)))
+		}
 		// One forged response per HTTP/1.1 connection: the client must not reuse
 		// a connection we took over from its real dependency. Connection is
 		// hop-by-hop and illegal in HTTP/2, where the client owns the lifetime —
@@ -170,13 +208,22 @@ func (r Response) handler(delivered *atomic.Bool) http.Handler {
 			h.Set("Connection", "close")
 		}
 		w.WriteHeader(status)
-		_, _ = io.WriteString(w, body)
-		delivered.Store(true)
+		if body != "" {
+			_, _ = io.WriteString(w, body)
+		}
+		// Report at the point of writing, not when the connection ends: an HTTP/2
+		// client holds the connection open for the whole attack.
+		if delivered.CompareAndSwap(false, true) && q.OnDelivered != nil {
+			q.OnDelivered()
+		}
 	})
 }
 
+// resolvedStatus rejects 1xx as out of range: net/http treats an informational
+// status as non-committing, so a body written after it would silently commit
+// 200 instead — the client would see success where a fault was configured.
 func (r Response) resolvedStatus() int {
-	if r.Status < 100 || r.Status > 599 {
+	if r.Status < 200 || r.Status > 599 {
 		return http.StatusServiceUnavailable
 	}
 	return r.Status

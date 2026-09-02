@@ -274,11 +274,23 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 			return
 
 		case proto == protoTLS && s.TLSInject != nil && identity != "":
-			err := s.TLSInject.ServeForged(ctx, client, prefix, tlsinject.Response{
-				Status:  action.HTTPStatus,
-				Body:    action.HTTPBody,
-				Headers: action.HTTPHeaders,
-			}, s.peekTimeout())
+			// Counted from the delivery callback, not after ServeForged returns: an
+			// HTTP/2 client keeps the connection pooled for the whole attack, so
+			// counting on return would report a working fault as "matched but never
+			// faulted" — the proxy's own silent-no-op signature.
+			err := s.TLSInject.ServeForged(ctx, client, prefix, tlsinject.Request{
+				Response: tlsinject.Response{
+					Status:  action.HTTPStatus,
+					Body:    action.HTTPBody,
+					Headers: action.HTTPHeaders,
+				},
+				HandshakeTimeout: s.peekTimeout(),
+				OnDelivered: func() {
+					markFaulted()
+					s.Metrics.HTTPInjected()
+					log.Info("injected https status", slog.Int("status", action.HTTPStatus))
+				},
+			})
 
 			var rejErr *tlsinject.RejectedError
 			if errors.As(err, &rejErr) {
@@ -292,13 +304,15 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 				return
 			}
 			if err != nil {
+				// The connection was taken over and cannot be forwarded now, so it
+				// ends here. Count it so matched still reconciles with the outcome
+				// counters instead of silently losing a connection.
+				s.Metrics.Dropped()
 				log.Debug("failed to serve injected https response", slog.Any("err", err))
 				return
 			}
-			// Recorded only once the response was actually delivered.
-			markFaulted()
-			s.Metrics.HTTPInjected()
-			log.Info("injected https status", slog.Int("status", action.HTTPStatus))
+			// Success is reported by OnDelivered above, which fires when the
+			// response is written rather than when the connection ends.
 			return
 		}
 	}

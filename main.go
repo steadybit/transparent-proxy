@@ -71,8 +71,8 @@ func main() {
 		// one fault, avoiding a JSON --config file. Appended to any --config rules.
 		faultLatency = flag.Duration("fault-latency", 0, "single fault: latency added before connecting upstream")
 		faultReset   = flag.Bool("fault-reset", false, "single fault: reset (RST) matching connections")
-		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7, cleartext HTTP)")
-		faultBody    = flag.String("fault-http-body", "", "single fault: injected HTTP response body (L7, cleartext HTTP)")
+		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
+		faultBody    = flag.String("fault-http-body", "", "single fault: injected HTTP response body (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
 		faultProb    = flag.Float64("fault-probability", 1, "single fault: probability [0,1] to apply the fault per connection (default 1 = always, 0 = never)")
 		faultHosts   = flag.String("fault-hosts", "", "single fault: comma-separated host selectors (SNI/Host)")
 		faultCIDRs   = flag.String("fault-cidrs", "", "single fault: comma-separated CIDR selectors")
@@ -99,16 +99,6 @@ func main() {
 		logger.Info("loaded fault rules", slog.Int("count", len(rules)))
 	}
 
-	injector, err := loadInterceptCA(*tlsCACert, *tlsCAKey)
-	if err != nil {
-		logger.Error("invalid TLS interception CA", slog.Any("err", err))
-		os.Exit(2)
-	}
-	if injector != nil {
-		logger.Info("HTTPS response injection enabled",
-			slog.Time("ca_not_after", injector.NotAfter()))
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -120,7 +110,6 @@ func main() {
 		DialTimeout: *dialTimeout,
 		Mark:        uint32(*mark),
 		Metrics:     m,
-		TLSInject:   injector,
 	}
 
 	// The metrics endpoint runs for the whole process lifetime.
@@ -157,6 +146,22 @@ func main() {
 		}
 		logger.Info("interception reverted", slog.String("exec_id", *execID))
 		return
+	}
+
+	// The CA is loaded only after the --revert branch above: teardown must never
+	// depend on it. An orchestrator naturally reuses the same argument vector for
+	// --revert, by which time the CA files may be gone or expired — refusing to
+	// start there would leave the interception rules installed, breaking the
+	// guaranteed-cleanup contract.
+	injector, err := loadInterceptCA(*tlsCACert, *tlsCAKey)
+	if err != nil {
+		logger.Error("invalid TLS interception CA", slog.Any("err", err))
+		os.Exit(2)
+	}
+	if injector != nil {
+		srv.TLSInject = injector
+		logger.Info("HTTPS response injection enabled",
+			slog.Time("ca_not_after", injector.NotAfter()))
 	}
 
 	// Preflight: refuse to fight an existing mesh proxy. Ports default to the

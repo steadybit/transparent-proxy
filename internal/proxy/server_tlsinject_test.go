@@ -169,6 +169,54 @@ func TestServer_TLSInject_ForgesResponse(t *testing.T) {
 	}
 }
 
+// Regression: HTTP/2 clients pool the connection for the whole attack. The
+// fault counters must reflect the injection while that connection is still
+// open — otherwise a working attack reports as "matched but never faulted",
+// which the platform reads as a silent no-op.
+func TestServer_TLSInject_CountsWhileHTTP2ConnectionStaysOpen(t *testing.T) {
+	upstream, dst := startTLSUpstream(t)
+	ca, caPEM := newInterceptCA(t)
+	m := metrics.New()
+
+	proxyAddr := serveProxy(t, &Server{Faults: httpsRule(), Metrics: m, TLSInject: ca}, dst)
+
+	pool := x509.NewCertPool()
+	pool.AddCert(upstream.Certificate())
+	if !pool.AppendCertsFromPEM(caPEM) {
+		t.Fatal("failed to add intercept CA to pool")
+	}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", proxyAddr.String())
+		},
+		TLSClientConfig:   &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2: true,
+	}
+	defer tr.CloseIdleConnections()
+
+	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	resp, err := client.Get("https://" + upstreamHost + "/v1/messages")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.Proto != "HTTP/2.0" {
+		t.Fatalf("proto = %q, want HTTP/2.0 so the connection stays pooled", resp.Proto)
+	}
+
+	// Deliberately do NOT close idle connections first — that is the bug.
+	waitFor(t, func() bool { return m.Snapshot().ConnectionsFaulted == 1 },
+		"the fault to be counted while the h2 connection is still open")
+	snap := m.Snapshot()
+	if snap.HTTPResponsesInjected != 1 {
+		t.Fatalf("HTTPResponsesInjected = %d, want 1", snap.HTTPResponsesInjected)
+	}
+	if got := snap.PerHost[upstreamHost]; got.Faulted != 1 {
+		t.Fatalf("per-host faulted = %d, want 1", got.Faulted)
+	}
+}
+
 // Without a CA the same rule must leave HTTPS alone — the pre-existing
 // behaviour, and the guarantee that enabling the feature is opt-in.
 func TestServer_TLSInject_DisabledPassesThrough(t *testing.T) {

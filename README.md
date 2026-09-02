@@ -126,9 +126,11 @@ fabricated rather than a modified real one.
 - the connection lost the `probability` roll.
 
 **When the client refuses** — if the workload does not trust the CA (or pins
-certificates), the handshake fails. That is counted as `tls_intercept_rejected`
-and is deliberately *not* counted as a fault, so a non-zero value is the signal
-that the CA is missing from the target's truststore rather than a silent no-op.
+certificates) it either fails the handshake, or, under TLS 1.3, completes it and
+then walks away without sending a request. Both are counted as
+`tls_intercept_rejected` and deliberately *not* as a fault, so a non-zero value
+is the signal that the CA is missing from the target's truststore rather than a
+silent no-op. Only a response actually written counts as an injected fault.
 
 > Interception requires a key that can impersonate any HTTPS endpoint to
 > anything trusting the CA. Treat it as a test/staging capability and keep the

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -35,7 +36,7 @@ func serveForgedOnce(t *testing.T, ca *CA, r Response) (string, <-chan error) {
 			ch <- aerr
 			return
 		}
-		ch <- ca.ServeForged(context.Background(), conn, nil, r, 5*time.Second)
+		ch <- ca.ServeForged(context.Background(), conn, nil, Request{Response: r, HandshakeTimeout: 5 * time.Second})
 	}()
 	return ln.Addr().String(), ch
 }
@@ -197,6 +198,112 @@ func Test_ServeForged_rejectedAfterHandshakeIsNotDelivery(t *testing.T) {
 	}
 }
 
+// Regression: an HTTP/2 client pools the connection for the whole attack, so
+// delivery must be reported when the response is written — not when the
+// connection ends. Reporting it late leaves a demonstrably working fault
+// counted as "matched but never faulted", the proxy's silent-no-op signature.
+func Test_ServeForged_reportsDeliveryBeforeConnectionCloses(t *testing.T) {
+	ca, caPEM := mustLoadTestCA(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	delivered := make(chan struct{}, 1)
+	ch := make(chan error, 1)
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			ch <- aerr
+			return
+		}
+		ch <- ca.ServeForged(context.Background(), conn, nil, Request{
+			Response:         Response{Status: 503},
+			HandshakeTimeout: 5 * time.Second,
+			OnDelivered:      func() { delivered <- struct{}{} },
+		})
+	}()
+
+	client, tr := clientTrusting(t, caPEM, true)
+	resp, err := client.Get("https://" + ln.Addr().String() + "/v1/messages")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.Proto != "HTTP/2.0" {
+		t.Fatalf("proto = %q, want HTTP/2.0 so the connection stays pooled", resp.Proto)
+	}
+
+	// The connection is still open here; delivery must already be reported.
+	select {
+	case <-delivered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("delivery was not reported while the h2 connection was still open")
+	}
+	select {
+	case err := <-ch:
+		t.Fatalf("ServeForged returned early (%v); the h2 connection should still be open", err)
+	default:
+	}
+
+	tr.CloseIdleConnections()
+	if err := waitServed(t, ch); err != nil {
+		t.Fatalf("ServeForged: %v", err)
+	}
+}
+
+// Teardown must never be booked as a delivered fault: nothing was written, so
+// OnDelivered must not fire.
+func Test_ServeForged_cancelDoesNotReportDelivery(t *testing.T) {
+	ca, caPEM := mustLoadTestCA(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var deliveries atomic.Int64
+	ch := make(chan error, 1)
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			ch <- aerr
+			return
+		}
+		ch <- ca.ServeForged(ctx, conn, nil, Request{
+			Response:         Response{Status: 503},
+			HandshakeTimeout: 5 * time.Second,
+			OnDelivered:      func() { deliveries.Add(1) },
+		})
+	}()
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEM)
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{
+		RootCAs: pool, ServerName: testSNI, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	cancel()
+	if err := waitServed(t, ch); err != nil && !errors.Is(err, net.ErrClosed) {
+		var rej *RejectedError
+		if errors.As(err, &rej) {
+			t.Fatalf("teardown was misreported as a client rejection: %v", err)
+		}
+	}
+	if got := deliveries.Load(); got != 0 {
+		t.Fatalf("OnDelivered fired %d times on teardown; nothing was written", got)
+	}
+}
+
 func Test_ServeForged_cancelledContextClosesConnection(t *testing.T) {
 	ca, caPEM := mustLoadTestCA(t)
 
@@ -214,7 +321,7 @@ func Test_ServeForged_cancelledContextClosesConnection(t *testing.T) {
 			ch <- aerr
 			return
 		}
-		ch <- ca.ServeForged(ctx, conn, nil, Response{Status: 503}, 5*time.Second)
+		ch <- ca.ServeForged(ctx, conn, nil, Request{Response: Response{Status: 503}, HandshakeTimeout: 5 * time.Second})
 	}()
 
 	// HTTP/2 holds the connection open after the response, so once a reply has
