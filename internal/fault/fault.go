@@ -43,9 +43,13 @@ type Rule struct {
 	Abort bool
 
 	// HTTPStatus, if non-zero, makes the proxy synthesize an HTTP response with
-	// this status code instead of forwarding — an L7 fault that applies only to
-	// cleartext HTTP (it is ignored on TLS/opaque connections). Selected by the
-	// Host header, matched with the same semantics as Hosts.
+	// this status code instead of forwarding — an L7 fault selected by the Host
+	// header or TLS SNI, matched with the same semantics as Hosts.
+	//
+	// It applies to cleartext HTTP always, and to HTTPS only when the proxy was
+	// given an interception CA (--tls-ca-cert/--tls-ca-key): the connection is
+	// then terminated with a certificate minted for its SNI. Without a CA, TLS
+	// connections are spliced through untouched. Opaque L4 is never affected.
 	HTTPStatus int
 
 	// HTTPBody, if set, replaces the default synthesized response body.

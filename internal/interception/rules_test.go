@@ -269,3 +269,53 @@ func TestRevert_FailsVerificationWhenRulesRemain(t *testing.T) {
 		t.Fatal("Revert must fail verification while a chain still contains rules")
 	}
 }
+
+// The capture filter is deliberately broad (0.0.0.0/0 on 80/443) because the
+// proxy picks its victims by hostname. The flush cannot — it is a stateless
+// REJECT that knows only addresses — so scoping it to the capture filter would
+// reset every established HTTP/HTTPS connection in the target, not just the
+// dependency under test.
+func Test_flushIsScopedToResolvedDestinations(t *testing.T) {
+	base := Config{
+		ExecutionID: "exec",
+		ProxyPort:   3128,
+		Filter: Filter{
+			Include: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+			Ports:   []uint16{80, 443},
+		},
+	}
+
+	// Without resolved destinations the flush covers the whole capture filter —
+	// what a CIDR-targeted attack wants.
+	broad := strings.Join(base.AddScript(), "\n")
+	if !strings.Contains(broad, "-d 0.0.0.0/0 --dport 443 -m conntrack --ctstate ESTABLISHED -j REJECT") {
+		t.Fatalf("expected a filter-wide flush without resolved hosts:\n%s", broad)
+	}
+
+	scoped := base
+	scoped.FlushDestinations = []netip.Prefix{
+		netip.MustParsePrefix("93.184.216.34/32"),
+		netip.MustParsePrefix("1.2.3.4/32"),
+	}
+	got := strings.Join(scoped.AddScript(), "\n")
+
+	for _, want := range []string{
+		"-d 93.184.216.34/32 --dport 80 -m conntrack --ctstate ESTABLISHED -j REJECT",
+		"-d 93.184.216.34/32 --dport 443 -m conntrack --ctstate ESTABLISHED -j REJECT",
+		"-d 1.2.3.4/32 --dport 443 -m conntrack --ctstate ESTABLISHED -j REJECT",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing scoped flush rule %q in:\n%s", want, got)
+		}
+	}
+	// The whole point: nothing else on those ports is reset.
+	if strings.Contains(got, "-d 0.0.0.0/0 --dport 443 -m conntrack --ctstate ESTABLISHED -j REJECT") {
+		t.Fatalf("flush still resets the entire capture filter:\n%s", got)
+	}
+	// Capture itself must stay broad — the proxy still needs to see everything
+	// so it can match by hostname.
+	if !strings.Contains(got, "-d 0.0.0.0/0 -p tcp -m tcp --dport 443 -j REDIRECT") &&
+		!strings.Contains(got, "0.0.0.0/0") {
+		t.Fatalf("capture filter was narrowed too:\n%s", got)
+	}
+}

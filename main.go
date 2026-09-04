@@ -19,6 +19,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -37,6 +38,7 @@ import (
 	"github.com/steadybit/transparent-proxy/internal/preflight"
 	"github.com/steadybit/transparent-proxy/internal/proxy"
 	"github.com/steadybit/transparent-proxy/internal/supervisor"
+	"github.com/steadybit/transparent-proxy/internal/tlsinject"
 )
 
 func main() {
@@ -60,12 +62,20 @@ func main() {
 
 		revert = flag.Bool("revert", false, "remove the interception rules for the given --exec-id/--intercept-* and exit (out-of-band teardown, idempotent)")
 
+		// HTTPS response injection. The CA is supplied by the customer, who owns
+		// its validity and installs it in their workloads' truststores; the proxy
+		// only signs per-SNI leaves with it. Unset = TLS is never decrypted.
+		tlsCACert  = flag.String("tls-ca-cert", "", "PEM CA certificate used to mint per-SNI certificates, enabling HTTPS response injection (requires --tls-ca-key)")
+		tlsCAKey   = flag.String("tls-ca-key", "", "PEM private key matching --tls-ca-cert")
+		tlsLeafTTL = flag.Duration("tls-leaf-validity", 0, "how long minted per-SNI certificates are valid (0 = built-in default; always clamped to the CA's own expiry)")
+		tlsCAStdin = flag.Bool("tls-ca-stdin", false, "read the interception CA (certificate and private key, one PEM stream) from stdin instead of from files")
+
 		// Single-rule fault flags — a convenience for orchestrators that inject
 		// one fault, avoiding a JSON --config file. Appended to any --config rules.
 		faultLatency = flag.Duration("fault-latency", 0, "single fault: latency added before connecting upstream")
 		faultReset   = flag.Bool("fault-reset", false, "single fault: reset (RST) matching connections")
-		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7, cleartext HTTP)")
-		faultBody    = flag.String("fault-http-body", "", "single fault: injected HTTP response body (L7, cleartext HTTP)")
+		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
+		faultBody    = flag.String("fault-http-body", "", "single fault: injected HTTP response body (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
 		faultProb    = flag.Float64("fault-probability", 1, "single fault: probability [0,1] to apply the fault per connection (default 1 = always, 0 = never)")
 		faultHosts   = flag.String("fault-hosts", "", "single fault: comma-separated host selectors (SNI/Host)")
 		faultCIDRs   = flag.String("fault-cidrs", "", "single fault: comma-separated CIDR selectors")
@@ -119,7 +129,7 @@ func main() {
 	// Validate the interception filter and whether self-managed mode is wanted.
 	// The port is filled in after we bind (below); 0 is fine here because this
 	// instance is only used for --revert, where the port is irrelevant.
-	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), 0, *noFlush)
+	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), 0, *noFlush, nil)
 	if err != nil {
 		logger.Error("invalid interception configuration", slog.Any("err", err))
 		os.Exit(2)
@@ -139,6 +149,23 @@ func main() {
 		}
 		logger.Info("interception reverted", slog.String("exec_id", *execID))
 		return
+	}
+
+	// The CA is loaded only after the --revert branch above: teardown must never
+	// depend on it. An orchestrator naturally reuses the same argument vector for
+	// --revert, by which time the CA files may be gone or expired — refusing to
+	// start there would leave the interception rules installed, breaking the
+	// guaranteed-cleanup contract.
+	injector, err := loadInterceptCA(*tlsCACert, *tlsCAKey, *tlsCAStdin)
+	if err != nil {
+		logger.Error("invalid TLS interception CA", slog.Any("err", err))
+		os.Exit(2)
+	}
+	if injector != nil {
+		injector.SetLeafValidity(*tlsLeafTTL)
+		srv.TLSInject = injector
+		logger.Info("HTTPS response injection enabled",
+			slog.Time("ca_not_after", injector.NotAfter()))
 	}
 
 	// Preflight: refuse to fight an existing mesh proxy. Ports default to the
@@ -164,7 +191,7 @@ func main() {
 			os.Exit(1)
 		}
 		port := uint16(ln.Addr().(*net.TCPAddr).Port)
-		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port, *noFlush)
+		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port, *noFlush, flushDestinations(rules, logger))
 		if err != nil {
 			logger.Error("invalid interception configuration", slog.Any("err", err))
 			os.Exit(2)
@@ -190,11 +217,121 @@ func main() {
 	logger.Info("proxy stopped", slog.Any("metrics", m.Snapshot()))
 }
 
+const (
+	// maxCAStdinBytes caps the CA read from stdin; a PEM pair is a few KB.
+	maxCAStdinBytes = 1 << 20
+	// caStdinTimeout bounds that read, so a writer that never closes the pipe
+	// fails loudly instead of hanging the proxy before it installs anything.
+	caStdinTimeout = 30 * time.Second
+)
+
+// flushDestinations resolves the hostnames the fault rules target, so the
+// connection-pool flush can be narrowed to those addresses.
+//
+// This runs inside the target's network namespace, so it sees the same routes
+// the workload does. It is a snapshot: a dependency behind rotating IPs may
+// hold connections to an address that no longer resolves, and those simply are
+// not flushed — they still get faulted when they next reconnect. Under-flushing
+// is the right side to err on, since over-flushing resets connections to
+// dependencies the attack never named.
+//
+// Returns nil when no rule targets a hostname, which leaves the flush scoped to
+// the capture filter — what a CIDR-targeted attack actually wants.
+func flushDestinations(rules []fault.Rule, logger *slog.Logger) []netip.Prefix {
+	var hosts []string
+	for _, r := range rules {
+		hosts = append(hosts, r.Hosts...)
+	}
+	if len(hosts) == 0 {
+		return nil
+	}
+
+	seen := map[netip.Prefix]bool{}
+	var out []netip.Prefix
+	for _, h := range hosts {
+		addrs, err := net.LookupHost(h)
+		if err != nil {
+			// Not fatal: the attack still applies to new connections. Warn,
+			// because the operator asked for existing ones to be reset too.
+			logger.Warn("could not resolve a targeted dependency; its existing connections will not be reset",
+				slog.String("host", h), slog.Any("err", err))
+			continue
+		}
+		for _, a := range addrs {
+			addr, perr := netip.ParseAddr(a)
+			if perr != nil || !addr.Is4() {
+				continue // interception is IPv4-only
+			}
+			pfx := netip.PrefixFrom(addr, 32)
+			if !seen[pfx] {
+				seen[pfx] = true
+				out = append(out, pfx)
+			}
+		}
+	}
+	if len(out) == 0 {
+		logger.Warn("no targeted dependency resolved to an IPv4 address; existing connections will not be reset")
+	}
+	return out
+}
+
 func loadRules(path string) ([]fault.Rule, error) {
 	if path == "" {
 		return nil, nil
 	}
 	return config.Load(path)
+}
+
+// loadInterceptCA loads the optional HTTPS-interception CA. Returning (nil, nil)
+// means the feature is off and TLS is never decrypted.
+//
+// The customer owns this CA — they generate it, choose how long it lives, and
+// install it in the truststores of the workloads they want to fault. The only
+// lifecycle judgement made here is refusing one that is already outside its
+// validity window, because it would otherwise fail every handshake with a far
+// less obvious error.
+func loadInterceptCA(certPath, keyPath string, fromStdin bool) (*tlsinject.CA, error) {
+	var (
+		ca  *tlsinject.CA
+		err error
+	)
+	switch {
+	case fromStdin && (certPath != "" || keyPath != ""):
+		return nil, errors.New("--tls-ca-stdin cannot be combined with --tls-ca-cert/--tls-ca-key")
+	case fromStdin:
+		// Reading the key from stdin keeps it off the command line and off any
+		// filesystem the target could reach. It is also the only channel that
+		// works uniformly: the proxy may run inside an overlay of the
+		// orchestrator's root, which does not carry the orchestrator's submounts,
+		// so a key mounted there is invisible by path.
+		// Bounded and deadlined: this read happens before the listener is bound,
+		// before preflight, and before the --max-duration deadman is armed, so a
+		// writer that never closes the pipe would hang the proxy forever with no
+		// rules installed and no way out.
+		_ = os.Stdin.SetReadDeadline(time.Now().Add(caStdinTimeout))
+		pemBytes, rerr := io.ReadAll(io.LimitReader(os.Stdin, maxCAStdinBytes+1))
+		_ = os.Stdin.SetReadDeadline(time.Time{})
+		if rerr != nil {
+			return nil, fmt.Errorf("failed to read CA from stdin: %w", rerr)
+		}
+		if len(pemBytes) > maxCAStdinBytes {
+			return nil, fmt.Errorf("CA on stdin exceeds %d bytes", maxCAStdinBytes)
+		}
+		ca, err = tlsinject.LoadCACombined(pemBytes)
+	case certPath == "" && keyPath == "":
+		return nil, nil
+	case certPath == "" || keyPath == "":
+		return nil, errors.New("--tls-ca-cert and --tls-ca-key must be set together")
+	default:
+		ca, err = tlsinject.LoadCAFromFiles(certPath, keyPath)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if ca.Expired(time.Now()) {
+		return nil, fmt.Errorf("CA is outside its validity window (not after %s); issue a new one", ca.NotAfter().Format(time.RFC3339))
+	}
+	return ca, nil
 }
 
 // stringList is a repeatable string flag (e.g. --fault-http-header used more
@@ -268,7 +405,7 @@ func (a interceptorAdapter) Revert(ctx context.Context) error { return a.cfg.Rev
 // targets the exact port the proxy bound — there is no pre-allocated port that
 // another process could steal between allocation and bind. For --revert the
 // port is irrelevant (chain names derive from the exec-id) and may be 0.
-func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyPort uint16, noFlush bool) (supervisor.Interceptor, bool, error) {
+func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyPort uint16, noFlush bool, flushDsts []netip.Prefix) (supervisor.Interceptor, bool, error) {
 	if cidrs == "" && ports == "" {
 		return nil, false, nil
 	}
@@ -290,10 +427,11 @@ func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyP
 	}
 
 	cfg := interception.Config{
-		ExecutionID: execID,
-		ProxyPort:   proxyPort,
-		Mark:        mark,
-		SkipFlush:   noFlush,
+		ExecutionID:       execID,
+		ProxyPort:         proxyPort,
+		Mark:              mark,
+		SkipFlush:         noFlush,
+		FlushDestinations: flushDsts,
 		Filter: interception.Filter{
 			Include: include,
 			Exclude: exclude,

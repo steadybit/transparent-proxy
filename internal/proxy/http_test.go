@@ -49,9 +49,9 @@ func Test_writeHTTPResponse_defaults(t *testing.T) {
 func Test_writeHTTPResponse_customBodyAndHeaders(t *testing.T) {
 	body := `{"error":"nope"}`
 	resp := readSynthesized(t, 429, map[string]string{
-		"content-type":  "application/json", // lower-case, should be canonicalized + override default
-		"Retry-After":   "30",
-		"X-Fault":       "injected",
+		"content-type": "application/json", // lower-case, should be canonicalized + override default
+		"Retry-After":  "30",
+		"X-Fault":      "injected",
 	}, body)
 	defer resp.Body.Close()
 
