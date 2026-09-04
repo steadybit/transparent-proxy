@@ -39,9 +39,10 @@ import (
 )
 
 const (
-	// leafValidity bounds a minted leaf's lifetime. It is additionally clamped
-	// to the CA's own NotAfter, so a leaf never outlives its issuer.
-	leafValidity = 24 * time.Hour
+	// defaultLeafValidity bounds a minted leaf's lifetime when the caller does
+	// not choose one. It is additionally clamped to the CA's own NotAfter, so a
+	// leaf never outlives its issuer.
+	defaultLeafValidity = 24 * time.Hour
 	// leafBackdate tolerates modest clock skew between the proxy and the client.
 	leafBackdate = 1 * time.Hour
 	// leafRenewBefore re-mints a cached leaf this long before it expires, so a
@@ -74,8 +75,30 @@ type CA struct {
 	// keypair. It never leaves this process.
 	leafKey *ecdsa.PrivateKey
 
+	// leafValidity is how long a minted leaf is valid for. Shorter values limit
+	// the window in which a leaf that escaped the proxy would be usable, at the
+	// cost of re-signing more often.
+	leafValidity time.Duration
+
 	mu    sync.Mutex
 	cache map[string]*tls.Certificate
+}
+
+// SetLeafValidity overrides how long minted leaves are valid. Values below the
+// renew window are raised to it, since a leaf shorter than that would be
+// considered stale the moment it is issued and re-signed on every handshake.
+func (c *CA) SetLeafValidity(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	if d < 2*leafRenewBefore {
+		d = 2 * leafRenewBefore
+	}
+	c.mu.Lock()
+	c.leafValidity = d
+	// Existing leaves were cut to the old window; drop them so the new one applies.
+	c.cache = map[string]*tls.Certificate{}
+	c.mu.Unlock()
 }
 
 // LoadCA parses a PEM certificate and matching private key. The certificate
@@ -104,7 +127,7 @@ func LoadCA(certPEM, keyPEM []byte) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate leaf key: %w", err)
 	}
-	return &CA{cert: cert, key: signer, leafKey: leafKey, cache: map[string]*tls.Certificate{}}, nil
+	return &CA{cert: cert, key: signer, leafKey: leafKey, leafValidity: defaultLeafValidity, cache: map[string]*tls.Certificate{}}, nil
 }
 
 // LoadCACombined parses one PEM stream carrying both the CA certificate and its
@@ -249,7 +272,13 @@ func (c *CA) mint(host string) (*tls.Certificate, error) {
 	}
 
 	now := time.Now()
-	notAfter := now.Add(leafValidity)
+	c.mu.Lock()
+	validity := c.leafValidity
+	c.mu.Unlock()
+	if validity <= 0 {
+		validity = defaultLeafValidity
+	}
+	notAfter := now.Add(validity)
 	// A leaf must never outlive the CA that signed it.
 	if notAfter.After(c.cert.NotAfter) {
 		notAfter = c.cert.NotAfter

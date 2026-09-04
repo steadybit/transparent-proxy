@@ -67,6 +67,7 @@ func main() {
 		// only signs per-SNI leaves with it. Unset = TLS is never decrypted.
 		tlsCACert  = flag.String("tls-ca-cert", "", "PEM CA certificate used to mint per-SNI certificates, enabling HTTPS response injection (requires --tls-ca-key)")
 		tlsCAKey   = flag.String("tls-ca-key", "", "PEM private key matching --tls-ca-cert")
+		tlsLeafTTL = flag.Duration("tls-leaf-validity", 0, "how long minted per-SNI certificates are valid (0 = built-in default; always clamped to the CA's own expiry)")
 		tlsCAStdin = flag.Bool("tls-ca-stdin", false, "read the interception CA (certificate and private key, one PEM stream) from stdin instead of from files")
 
 		// Single-rule fault flags — a convenience for orchestrators that inject
@@ -161,6 +162,7 @@ func main() {
 		os.Exit(2)
 	}
 	if injector != nil {
+		injector.SetLeafValidity(*tlsLeafTTL)
 		srv.TLSInject = injector
 		logger.Info("HTTPS response injection enabled",
 			slog.Time("ca_not_after", injector.NotAfter()))
