@@ -80,6 +80,13 @@ type CA struct {
 	// cost of re-signing more often.
 	leafValidity time.Duration
 
+	// chain is every certificate the operator supplied, signing certificate
+	// first. Presenting all of them lets an intermediate CA be used: the client
+	// trusts the root it already has, and we hand it the intermediates needed to
+	// build the path. Signing with an intermediate means the operator never has
+	// to part with a root key.
+	chain [][]byte
+
 	mu    sync.Mutex
 	cache map[string]*tls.Certificate
 }
@@ -127,7 +134,14 @@ func LoadCA(certPEM, keyPEM []byte) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate leaf key: %w", err)
 	}
-	return &CA{cert: cert, key: signer, leafKey: leafKey, leafValidity: defaultLeafValidity, cache: map[string]*tls.Certificate{}}, nil
+	return &CA{
+		cert:         cert,
+		key:          signer,
+		chain:        pair.Certificate,
+		leafKey:      leafKey,
+		leafValidity: defaultLeafValidity,
+		cache:        map[string]*tls.Certificate{},
+	}, nil
 }
 
 // LoadCACombined parses one PEM stream carrying both the CA certificate and its
@@ -316,10 +330,14 @@ func (c *CA) mint(host string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse minted certificate: %w", err)
 	}
+	// leaf first, then everything the operator supplied, so a client holding
+	// only the root can still build the path through any intermediates.
+	chain := make([][]byte, 0, len(c.chain)+1)
+	chain = append(chain, der)
+	chain = append(chain, c.chain...)
+
 	return &tls.Certificate{
-		// Send the CA alongside the leaf so clients that trust it by a different
-		// path can still build the chain.
-		Certificate: [][]byte{der, c.cert.Raw},
+		Certificate: chain,
 		PrivateKey:  c.leafKey,
 		Leaf:        leaf,
 	}, nil

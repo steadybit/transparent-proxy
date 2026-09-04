@@ -127,8 +127,14 @@ that CA, and answers the request itself. **HTTP/1.1 and HTTP/2 are both
 supported** — the response is delivered over whichever the client negotiates
 via ALPN.
 
-**The CA is yours.** You generate it, choose how long it lives, and install it
-in the truststores of the workloads you want to fault. The proxy only signs with
+**The CA is yours, and it need not be a root.** An intermediate issued by your
+own PKI works and is the better choice: you keep the root key offline, the
+workloads already trust the root, and the proxy presents the intermediate so
+the chain still builds. Constrain it further with `nameConstraints` if you want
+it usable only for the dependencies under test.
+
+You generate it, choose how long it lives, and install the trust anchor in the
+truststores of the workloads you want to fault. The proxy only signs with
 it; it never creates, rotates, or renews a CA. A CA already outside its validity
 window is rejected at startup rather than failing every handshake later.
 

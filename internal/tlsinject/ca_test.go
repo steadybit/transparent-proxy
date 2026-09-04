@@ -293,3 +293,74 @@ func Test_LoadCACombined_rejectsEncryptedKey(t *testing.T) {
 		t.Fatalf("err = %v, want a pointed passphrase-protected message", err)
 	}
 }
+
+// An operator must never have to hand over a root key. Signing with an
+// intermediate issued by their own PKI has to work: the client trusts only the
+// root it already has, and the proxy supplies the intermediate so the path can
+// be built.
+func Test_LoadCA_worksWithAnIntermediate(t *testing.T) {
+	// root (stays offline; only its certificate is trusted by the client)
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "Customer Root CA"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(72 * time.Hour),
+		IsCA: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTmpl, rootTmpl, rootKey.Public(), rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootCert, _ := x509.ParseCertificate(rootDER)
+
+	// intermediate — this is what the operator hands the proxy
+	interKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "Steadybit Intercept Intermediate"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(48 * time.Hour),
+		IsCA: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true,
+	}
+	interDER, err := x509.CreateCertificate(rand.Reader, interTmpl, rootCert, interKey.Public(), rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interKeyDER, _ := x509.MarshalECPrivateKey(interKey)
+
+	// The operator supplies intermediate (+ root) and the intermediate's key.
+	certPEM := append(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: interDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})...)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: interKeyDER})
+
+	ca, err := LoadCA(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("an intermediate CA must be accepted: %v", err)
+	}
+	cert, err := ca.leafFor("api.example.com")
+	if err != nil {
+		t.Fatalf("leafFor: %v", err)
+	}
+
+	// The client trusts ONLY the root; the chain we present must let it verify.
+	roots := x509.NewCertPool()
+	roots.AddCert(rootCert)
+	inters := x509.NewCertPool()
+	for _, der := range cert.Certificate[1:] {
+		c, perr := x509.ParseCertificate(der)
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		inters.AddCert(c)
+	}
+	if _, err := cert.Leaf.Verify(x509.VerifyOptions{
+		Roots: roots, Intermediates: inters, DNSName: "api.example.com",
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}); err != nil {
+		t.Fatalf("a client trusting only the root could not verify the presented chain: %v", err)
+	}
+}
