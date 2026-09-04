@@ -50,6 +50,21 @@ type Config struct {
 	// reset so they re-establish through the proxy and immediately feel the
 	// fault; set it when only new connections should be affected.
 	SkipFlush bool
+	// FlushDestinations narrows the connection-pool flush to these destinations
+	// instead of the whole capture filter.
+	//
+	// The capture filter is deliberately broad — typically 0.0.0.0/0 on ports
+	// 80 and 443 — because the proxy decides what to fault by hostname once it
+	// has seen the request. The flush cannot do that: it is a stateless iptables
+	// REJECT and knows only addresses. Applying it to the capture filter would
+	// therefore reset every established HTTP/HTTPS connection in the target,
+	// including ones to dependencies the attack never names. Resolving the
+	// targeted hostnames up front and flushing only those addresses keeps the
+	// collateral to the dependency actually under test.
+	//
+	// Empty keeps the old behaviour and flushes the whole capture filter, which
+	// is what a CIDR-targeted attack (no hostnames) actually wants.
+	FlushDestinations []netip.Prefix
 }
 
 func (c Config) mark() uint32 {
@@ -129,7 +144,11 @@ func (c Config) AddScript() []string {
 		for _, ex := range excludes {
 			s = append(s, fmt.Sprintf("-A %s -d %s -j RETURN", flush, ex))
 		}
-		for _, in := range includes {
+		flushDsts := includes
+		if len(c.FlushDestinations) > 0 {
+			flushDsts = includeV4(c.FlushDestinations)
+		}
+		for _, in := range flushDsts {
 			for _, p := range c.Filter.Ports {
 				s = append(s, fmt.Sprintf("-A %s -p tcp -d %s --dport %d -m conntrack --ctstate ESTABLISHED -j REJECT --reject-with tcp-reset", flush, in, p))
 			}

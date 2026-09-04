@@ -129,7 +129,7 @@ func main() {
 	// Validate the interception filter and whether self-managed mode is wanted.
 	// The port is filled in after we bind (below); 0 is fine here because this
 	// instance is only used for --revert, where the port is irrelevant.
-	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), 0, *noFlush)
+	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), 0, *noFlush, nil)
 	if err != nil {
 		logger.Error("invalid interception configuration", slog.Any("err", err))
 		os.Exit(2)
@@ -191,7 +191,7 @@ func main() {
 			os.Exit(1)
 		}
 		port := uint16(ln.Addr().(*net.TCPAddr).Port)
-		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port, *noFlush)
+		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port, *noFlush, flushDestinations(rules, logger))
 		if err != nil {
 			logger.Error("invalid interception configuration", slog.Any("err", err))
 			os.Exit(2)
@@ -224,6 +224,56 @@ const (
 	// fails loudly instead of hanging the proxy before it installs anything.
 	caStdinTimeout = 30 * time.Second
 )
+
+// flushDestinations resolves the hostnames the fault rules target, so the
+// connection-pool flush can be narrowed to those addresses.
+//
+// This runs inside the target's network namespace, so it sees the same routes
+// the workload does. It is a snapshot: a dependency behind rotating IPs may
+// hold connections to an address that no longer resolves, and those simply are
+// not flushed — they still get faulted when they next reconnect. Under-flushing
+// is the right side to err on, since over-flushing resets connections to
+// dependencies the attack never named.
+//
+// Returns nil when no rule targets a hostname, which leaves the flush scoped to
+// the capture filter — what a CIDR-targeted attack actually wants.
+func flushDestinations(rules []fault.Rule, logger *slog.Logger) []netip.Prefix {
+	var hosts []string
+	for _, r := range rules {
+		hosts = append(hosts, r.Hosts...)
+	}
+	if len(hosts) == 0 {
+		return nil
+	}
+
+	seen := map[netip.Prefix]bool{}
+	var out []netip.Prefix
+	for _, h := range hosts {
+		addrs, err := net.LookupHost(h)
+		if err != nil {
+			// Not fatal: the attack still applies to new connections. Warn,
+			// because the operator asked for existing ones to be reset too.
+			logger.Warn("could not resolve a targeted dependency; its existing connections will not be reset",
+				slog.String("host", h), slog.Any("err", err))
+			continue
+		}
+		for _, a := range addrs {
+			addr, perr := netip.ParseAddr(a)
+			if perr != nil || !addr.Is4() {
+				continue // interception is IPv4-only
+			}
+			pfx := netip.PrefixFrom(addr, 32)
+			if !seen[pfx] {
+				seen[pfx] = true
+				out = append(out, pfx)
+			}
+		}
+	}
+	if len(out) == 0 {
+		logger.Warn("no targeted dependency resolved to an IPv4 address; existing connections will not be reset")
+	}
+	return out
+}
 
 func loadRules(path string) ([]fault.Rule, error) {
 	if path == "" {
@@ -355,7 +405,7 @@ func (a interceptorAdapter) Revert(ctx context.Context) error { return a.cfg.Rev
 // targets the exact port the proxy bound — there is no pre-allocated port that
 // another process could steal between allocation and bind. For --revert the
 // port is irrelevant (chain names derive from the exec-id) and may be 0.
-func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyPort uint16, noFlush bool) (supervisor.Interceptor, bool, error) {
+func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyPort uint16, noFlush bool, flushDsts []netip.Prefix) (supervisor.Interceptor, bool, error) {
 	if cidrs == "" && ports == "" {
 		return nil, false, nil
 	}
@@ -377,10 +427,11 @@ func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyP
 	}
 
 	cfg := interception.Config{
-		ExecutionID: execID,
-		ProxyPort:   proxyPort,
-		Mark:        mark,
-		SkipFlush:   noFlush,
+		ExecutionID:       execID,
+		ProxyPort:         proxyPort,
+		Mark:              mark,
+		SkipFlush:         noFlush,
+		FlushDestinations: flushDsts,
 		Filter: interception.Filter{
 			Include: include,
 			Exclude: exclude,
