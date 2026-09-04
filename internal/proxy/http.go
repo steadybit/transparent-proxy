@@ -133,12 +133,22 @@ func isHTTPMethodStart(b byte) bool {
 // Content-Type overrides the default); Content-Length and Connection are always
 // set by the proxy so they stay correct and the connection closes cleanly.
 func writeHTTPResponse(c net.Conn, status int, headers map[string]string, body string) error {
+	// Normalised the same way as the HTTPS path, so one rule produces the same
+	// response whether the matched dependency happened to be HTTP or HTTPS. 1xx
+	// is informational and cannot carry a fault; 204/304 must not carry a body.
+	if status < 200 || status > 599 {
+		status = http.StatusServiceUnavailable
+	}
+	noBody := status == http.StatusNoContent || status == http.StatusNotModified
 	reason := http.StatusText(status)
 	if reason == "" {
 		reason = "Fault Injected"
 	}
-	if body == "" {
+	if body == "" && !noBody {
 		body = fmt.Sprintf("%d %s (injected by steadybit transparent-proxy)\n", status, reason)
+	}
+	if noBody {
+		body = ""
 	}
 
 	h := map[string]string{"Content-Type": "text/plain; charset=utf-8"}
@@ -146,7 +156,9 @@ func writeHTTPResponse(c net.Conn, status int, headers map[string]string, body s
 		h[textproto.CanonicalMIMEHeaderKey(k)] = v
 	}
 	// Proxy-owned headers: keep the framing correct regardless of caller input.
-	h["Content-Length"] = strconv.Itoa(len(body))
+	if !noBody {
+		h["Content-Length"] = strconv.Itoa(len(body))
+	}
 	h["Connection"] = "close"
 
 	var sb strings.Builder

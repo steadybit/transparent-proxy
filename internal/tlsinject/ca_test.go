@@ -232,3 +232,64 @@ func Test_LoadCACombined(t *testing.T) {
 		t.Fatal("expected garbage to be rejected")
 	}
 }
+
+// A CA that expires mid-run must be reported as our failure, not as the client
+// rejecting us — otherwise the operator is sent to inspect a truststore that is
+// perfectly fine. This is the exact misdiagnosis the expiry check exists to
+// prevent, so it must not be undone by the error classification above it.
+func Test_mint_expiredCAIsCertErrorNotRejection(t *testing.T) {
+	certPEM, keyPEM := newTestCAPEM(t, time.Now().Add(2*time.Second), true)
+	ca, err := LoadCA(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("LoadCA: %v", err)
+	}
+	// Force the CA past its NotAfter without waiting.
+	ca.cert.NotAfter = time.Now().Add(-time.Minute)
+
+	_, err = ca.ServerTLSConfig().GetCertificate(&tls.ClientHelloInfo{ServerName: "api.example.com"})
+	if err == nil {
+		t.Fatal("expected minting to fail once the CA has expired")
+	}
+	if !isCertError(err) {
+		t.Fatalf("err = %v, want a *CertError so it is not misreported as a client rejection", err)
+	}
+}
+
+func Test_ServerTLSConfig_noSNIIsCertError(t *testing.T) {
+	ca, _ := mustLoadTestCA(t)
+	_, err := ca.ServerTLSConfig().GetCertificate(&tls.ClientHelloInfo{})
+	if !isCertError(err) {
+		t.Fatalf("err = %v, want a *CertError", err)
+	}
+}
+
+// With a fixed renew window, a CA with less than that window left would mark
+// every cached leaf permanently stale — turning each handshake into a fresh
+// signature under the mutex.
+func Test_leafFor_cachesEvenWhenCANearExpiry(t *testing.T) {
+	certPEM, keyPEM := newTestCAPEM(t, time.Now().Add(30*time.Minute), true) // < leafRenewBefore
+	ca, err := LoadCA(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("LoadCA: %v", err)
+	}
+	first, err := ca.leafFor("api.example.com")
+	if err != nil {
+		t.Fatalf("leafFor: %v", err)
+	}
+	second, err := ca.leafFor("api.example.com")
+	if err != nil {
+		t.Fatalf("leafFor: %v", err)
+	}
+	if first != second {
+		t.Fatal("cache thrashing: re-minted despite a still-valid leaf")
+	}
+}
+
+func Test_LoadCACombined_rejectsEncryptedKey(t *testing.T) {
+	certPEM, _ := newTestCAPEM(t, time.Now().Add(time.Hour), true)
+	enc := pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: []byte("nope")})
+	_, err := LoadCACombined(append(append([]byte{}, certPEM...), enc...))
+	if err == nil || !strings.Contains(err.Error(), "passphrase-protected") {
+		t.Fatalf("err = %v, want a pointed passphrase-protected message", err)
+	}
+}

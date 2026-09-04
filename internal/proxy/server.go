@@ -305,10 +305,15 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 			}
 			if err != nil {
 				// The connection was taken over and cannot be forwarded now, so it
-				// ends here. Count it so matched still reconciles with the outcome
-				// counters instead of silently losing a connection.
+				// ends here either way. Count it so matched still reconciles with the
+				// outcome counters instead of silently losing a connection.
 				s.Metrics.Dropped()
-				log.Debug("failed to serve injected https response", slog.Any("err", err))
+				if errors.Is(err, tlsinject.ErrNotDelivered) {
+					// Teardown while the connection was open: expected, not a failure.
+					log.Debug("interception ended without delivering a response", slog.Any("err", err))
+				} else {
+					log.Warn("failed to serve injected https response", slog.Any("err", err))
+				}
 				return
 			}
 			// Success is reported by OnDelivered above, which fires when the

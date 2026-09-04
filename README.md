@@ -104,6 +104,24 @@ transparent-proxy \
   --fault-hosts api.stripe.com --fault-http-status 503
 ```
 
+`--tls-ca-stdin` reads the same CA as **one PEM stream on stdin** (certificate
+and key, either order) instead of from files. This is what an orchestrator
+should use: it keeps the key off the command line, off any disk the target could
+reach, and it is the only channel that works when the proxy runs inside an
+overlay of the orchestrator's filesystem — an overlay does not carry the
+orchestrator's submounts, so a key mounted there (a Kubernetes Secret, say) is
+not visible by path.
+
+```bash
+cat intercept-ca.crt intercept-ca.key |
+  transparent-proxy --tls-ca-stdin \
+    --fault-hosts api.stripe.com --fault-http-status 503
+```
+
+**The caller must close stdin.** The read is capped at 1 MiB and bounded by a
+30s deadline, so a writer that never closes fails loudly rather than hanging the
+proxy before it installs any rules. The key must not be passphrase-protected.
+
 The proxy mints a short-lived certificate for the connection's SNI, signed by
 that CA, and answers the request itself. **HTTP/1.1 and HTTP/2 are both
 supported** — the response is delivered over whichever the client negotiates

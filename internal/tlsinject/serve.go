@@ -109,6 +109,11 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 			// rejection, and reporting it as one sends the operator hunting for a
 			// truststore problem that does not exist.
 			return fmt.Errorf("tls handshake did not complete within %s: %w", req.HandshakeTimeout, err)
+		case isCertError(err):
+			// We could not produce a certificate (expired CA, signing failure, no
+			// SNI). Blaming the client's truststore here would point the operator at
+			// the one thing that is not broken.
+			return err
 		default:
 			return &RejectedError{Stage: "handshake", Err: err}
 		}
@@ -133,14 +138,31 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 	if err := serveOne(tc, req, &delivered); err != nil {
 		return err
 	}
-	if delivered.Load() {
-		return nil
+	// Claim the flag rather than reading it. An HTTP/2 handler goroutine can
+	// still be finishing as ServeConn returns, so a plain read could see "not
+	// delivered", have the caller count a rejection, and then have the straggler
+	// fire OnDelivered — booking one connection into two mutually exclusive
+	// buckets. Winning this CAS means nothing was delivered and nothing can be.
+	if !delivered.CompareAndSwap(false, true) {
+		return nil // delivered; OnDelivered has fired or is firing
 	}
 	if ctx.Err() != nil {
 		// Torn down mid-connection: not the client's doing.
-		return nil
+		return ErrNotDelivered
 	}
 	return &RejectedError{Stage: "post-handshake"}
+}
+
+// ErrNotDelivered reports a connection that ended without a response and
+// without the client refusing us — teardown, essentially. It is returned so the
+// caller can account for the connection instead of silently losing it from the
+// outcome counters.
+var ErrNotDelivered = errors.New("tlsinject: connection ended without delivering a response")
+
+// isCertError reports whether err came from our own certificate production.
+func isCertError(err error) bool {
+	var ce *CertError
+	return errors.As(err, &ce)
 }
 
 // serveOne runs net/http over a single already-handshaken connection. Handing

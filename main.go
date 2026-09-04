@@ -215,6 +215,14 @@ func main() {
 	logger.Info("proxy stopped", slog.Any("metrics", m.Snapshot()))
 }
 
+const (
+	// maxCAStdinBytes caps the CA read from stdin; a PEM pair is a few KB.
+	maxCAStdinBytes = 1 << 20
+	// caStdinTimeout bounds that read, so a writer that never closes the pipe
+	// fails loudly instead of hanging the proxy before it installs anything.
+	caStdinTimeout = 30 * time.Second
+)
+
 func loadRules(path string) ([]fault.Rule, error) {
 	if path == "" {
 		return nil, nil
@@ -244,9 +252,18 @@ func loadInterceptCA(certPath, keyPath string, fromStdin bool) (*tlsinject.CA, e
 		// works uniformly: the proxy may run inside an overlay of the
 		// orchestrator's root, which does not carry the orchestrator's submounts,
 		// so a key mounted there is invisible by path.
-		pemBytes, rerr := io.ReadAll(os.Stdin)
+		// Bounded and deadlined: this read happens before the listener is bound,
+		// before preflight, and before the --max-duration deadman is armed, so a
+		// writer that never closes the pipe would hang the proxy forever with no
+		// rules installed and no way out.
+		_ = os.Stdin.SetReadDeadline(time.Now().Add(caStdinTimeout))
+		pemBytes, rerr := io.ReadAll(io.LimitReader(os.Stdin, maxCAStdinBytes+1))
+		_ = os.Stdin.SetReadDeadline(time.Time{})
 		if rerr != nil {
 			return nil, fmt.Errorf("failed to read CA from stdin: %w", rerr)
+		}
+		if len(pemBytes) > maxCAStdinBytes {
+			return nil, fmt.Errorf("CA on stdin exceeds %d bytes", maxCAStdinBytes)
 		}
 		ca, err = tlsinject.LoadCACombined(pemBytes)
 	case certPath == "" && keyPath == "":

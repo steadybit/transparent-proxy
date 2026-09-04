@@ -53,6 +53,16 @@ const (
 	maxCachedLeaves = 1024
 )
 
+// CertError marks a failure to produce a certificate at all — an expired CA, a
+// signing failure, a ClientHello with no SNI. It is our side failing, not the
+// client refusing us, and the two must not be conflated: reporting a dead CA as
+// "the client rejected the certificate" sends the operator to inspect a
+// truststore that is perfectly fine.
+type CertError struct{ Err error }
+
+func (e *CertError) Error() string { return "could not mint a certificate: " + e.Err.Error() }
+func (e *CertError) Unwrap() error { return e.Err }
+
 // CA mints per-SNI leaf certificates from a customer-supplied authority.
 // It is safe for concurrent use.
 type CA struct {
@@ -118,6 +128,10 @@ func LoadCACombined(pemBytes []byte) (*CA, error) {
 		switch {
 		case blk.Type == "CERTIFICATE":
 			certPEM = append(certPEM, pem.EncodeToMemory(blk)...)
+		case strings.Contains(blk.Type, "ENCRYPTED PRIVATE KEY"):
+			// Accepting it here would fail later inside X509KeyPair with an opaque
+			// parse error, hiding the actual problem.
+			return nil, errors.New("the CA key is passphrase-protected; supply an unencrypted PRIVATE KEY block")
 		case strings.Contains(blk.Type, "PRIVATE KEY"):
 			keyPEM = append(keyPEM, pem.EncodeToMemory(blk)...)
 		}
@@ -166,11 +180,15 @@ func (c *CA) ServerTLSConfig() *tls.Config {
 				// Without SNI there is no name to impersonate, so the handshake is
 				// aborted. There is no falling back to forwarding at this point: the
 				// ClientHello has been consumed and TLS records already written.
-				// Callers avoid reaching here by only interception connections whose
+				// Callers avoid reaching here by only intercepting connections whose
 				// SNI they already read.
-				return nil, errors.New("client sent no SNI; cannot mint a certificate")
+				return nil, &CertError{Err: errors.New("client sent no SNI")}
 			}
-			return c.leafFor(hello.ServerName)
+			cert, err := c.leafFor(hello.ServerName)
+			if err != nil {
+				return nil, &CertError{Err: err}
+			}
+			return cert, nil
 		},
 	}
 }
@@ -183,7 +201,7 @@ func (c *CA) ServerTLSConfig() *tls.Config {
 func (c *CA) leafFor(host string) (*tls.Certificate, error) {
 	now := time.Now()
 	c.mu.Lock()
-	if cert, ok := c.cache[host]; ok && now.Before(cert.Leaf.NotAfter.Add(-leafRenewBefore)) {
+	if cert, ok := c.cache[host]; ok && fresh(cert, now) {
 		c.mu.Unlock()
 		return cert, nil
 	}
@@ -199,7 +217,7 @@ func (c *CA) leafFor(host string) (*tls.Certificate, error) {
 	// Another goroutine may have minted the same host concurrently; prefer the
 	// stored one so every caller for a host shares a single certificate — unless
 	// it is the stale one we set out to replace.
-	if existing, ok := c.cache[host]; ok && now.Before(existing.Leaf.NotAfter.Add(-leafRenewBefore)) {
+	if existing, ok := c.cache[host]; ok && fresh(existing, now) {
 		return existing, nil
 	}
 	// Replacing an existing (stale) entry never grows the map, so the cap only
@@ -208,6 +226,20 @@ func (c *CA) leafFor(host string) (*tls.Certificate, error) {
 		c.cache[host] = cert
 	}
 	return cert, nil
+}
+
+// fresh reports whether a cached leaf is far enough from expiry to keep using.
+//
+// The renew window is clamped to half the remaining validity: leaves are capped
+// at the CA's own NotAfter, so once the CA has less than leafRenewBefore left,
+// a fixed window would mark every cached leaf permanently stale and re-sign on
+// every single handshake.
+func fresh(cert *tls.Certificate, now time.Time) bool {
+	renew := leafRenewBefore
+	if remaining := cert.Leaf.NotAfter.Sub(now); remaining/2 < renew {
+		renew = remaining / 2
+	}
+	return now.Before(cert.Leaf.NotAfter.Add(-renew))
 }
 
 func (c *CA) mint(host string) (*tls.Certificate, error) {
