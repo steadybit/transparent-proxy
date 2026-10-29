@@ -74,11 +74,27 @@ func sniffHTTP(c net.Conn, first byte) (protocol, string, []byte, error) {
 	buf := make([]byte, 0, 256)
 	buf = append(buf, first)
 	one := make([]byte, 1)
+	requestLine := true
 	for len(buf) < maxHeadBytes {
 		if _, err := io.ReadFull(c, one); err != nil {
 			return protoOther, "", buf, err
 		}
 		buf = append(buf, one[0])
+		// Give up as soon as the first line cannot be an HTTP/1.x request line,
+		// rather than waiting for a blank line that a text protocol starting
+		// with an uppercase letter (Redis inline "PING", NATS "CONNECT {...}")
+		// never sends — which would stall it for the whole peek timeout.
+		if requestLine {
+			if !plausibleRequestLine(buf) {
+				return protoOther, "", buf, nil
+			}
+			if bytes.HasSuffix(buf, []byte("\r\n")) {
+				requestLine = false
+				if !isHTTP1RequestLine(string(buf[:len(buf)-2])) {
+					return protoOther, "", buf, nil
+				}
+			}
+		}
 		if bytes.HasSuffix(buf, []byte("\r\n\r\n")) {
 			host, ok := parseHTTPHead(buf)
 			if !ok {
@@ -98,8 +114,7 @@ func parseHTTPHead(b []byte) (host string, ok bool) {
 	if len(lines) == 0 {
 		return "", false
 	}
-	parts := strings.Fields(lines[0])
-	if len(parts) != 3 || !strings.HasPrefix(parts[2], "HTTP/1.") {
+	if !isHTTP1RequestLine(lines[0]) {
 		return "", false
 	}
 	for _, line := range lines[1:] {
@@ -122,6 +137,36 @@ func hostWithoutPort(h string) string {
 		return host
 	}
 	return h
+}
+
+// maxMethodLen bounds the method token; the longest registered methods
+// (e.g. "VERSION-CONTROL") are well under it.
+const maxMethodLen = 20
+
+// plausibleRequestLine reports whether b, the request line read so far, can
+// still become an HTTP request line: a method token of uppercase letters, '-'
+// or '_' followed by a space, and no bare line break before the method ends.
+func plausibleRequestLine(b []byte) bool {
+	sp := bytes.IndexByte(b, ' ')
+	method := b
+	if sp >= 0 {
+		method = b[:sp]
+	}
+	if len(method) == 0 || len(method) > maxMethodLen {
+		return false
+	}
+	for _, ch := range method {
+		if (ch < 'A' || ch > 'Z') && ch != '-' && ch != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// isHTTP1RequestLine reports whether line is "METHOD target HTTP/1.x".
+func isHTTP1RequestLine(line string) bool {
+	parts := strings.Fields(line)
+	return len(parts) == 3 && strings.HasPrefix(parts[2], "HTTP/1.")
 }
 
 func isHTTPMethodStart(b byte) bool {
