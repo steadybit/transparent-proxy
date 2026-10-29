@@ -177,6 +177,13 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestAddScript_PortScopedKeepsLoopback(t *testing.T) {
+	// Port-scoped capture is unchanged: loopback on 80/443 is still in scope.
+	if strings.Contains(joined(baseConfig(t).AddScript()), "127.0.0.0/8") {
+		t.Fatal("port-scoped capture should not add the loopback exemption")
+	}
+}
+
 // recordingRunner captures what Apply/Revert would execute.
 type recordingRunner struct {
 	argv  []string

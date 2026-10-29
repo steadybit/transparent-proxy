@@ -6,6 +6,7 @@ package proxy
 import (
 	"crypto/tls"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -83,6 +84,36 @@ func TestSniff_OpaqueProtocol(t *testing.T) {
 	// Only the first byte is consumed for an opaque protocol.
 	if len(consumed) != 1 || consumed[0] != 0x00 {
 		t.Fatalf("consumed = %v, want first byte only", consumed)
+	}
+}
+
+// TestSniff_UppercaseTextProtocolsAreNotHeldAsHTTP proves client-first text
+// protocols that merely start with an uppercase letter are classified opaque
+// as soon as their first line rules out HTTP — not after the peek timeout.
+func TestSniff_UppercaseTextProtocolsAreNotHeldAsHTTP(t *testing.T) {
+	for name, payload := range map[string]string{
+		"h2 preface": "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			// Write the payload but never close or send a blank line: a sniff
+			// that waited for one would hit the deadline below.
+			go func() { _, _ = client.Write([]byte(payload)) }()
+
+			_ = server.SetReadDeadline(time.Now().Add(time.Second))
+			proto, identity, consumed, err := sniff(server)
+			if err != nil {
+				t.Fatalf("sniff waited for more input: %v", err)
+			}
+			if proto != protoOther || identity != "" {
+				t.Fatalf("proto = %v identity = %q, want opaque", proto, identity)
+			}
+			if !strings.HasPrefix(payload, string(consumed)) {
+				t.Fatalf("consumed %q is not a prefix of the payload", consumed)
+			}
+		})
 	}
 }
 
