@@ -196,7 +196,7 @@ func TestAddScript_AllPorts(t *testing.T) {
 		"-A SB_TP_REDIR_execid123456 -d " + loopbackCIDR + " -j RETURN",
 		"-A SB_TP_REDIR_execid123456 -p tcp -d 0.0.0.0/0 -j REDIRECT --to-ports 3128",
 		"-A SB_TP_FLUSH_execid123456 -d " + loopbackCIDR + " -j RETURN",
-		"-A SB_TP_FLUSH_execid123456 -p tcp -d 0.0.0.0/0 -m conntrack --ctstate ESTABLISHED -j REJECT --reject-with tcp-reset",
+		"-A SB_TP_FLUSH_execid123456 -p tcp -d 0.0.0.0/0 -m conntrack --ctstate ESTABLISHED --ctdir ORIGINAL -j REJECT --reject-with tcp-reset",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("AddScript missing line:\n  %s\nfull script:\n%s", want, script)

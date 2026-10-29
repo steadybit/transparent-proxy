@@ -48,10 +48,23 @@ func TestE2E_AllPorts_OnlyTheDependencyIsFaulted(t *testing.T) {
 	echoPort := startEchoOn(t, ip)
 	greetingPort := startGreetingOn(t, ip, "220 smtp.example.test ESMTP\r\n")
 
+	// Opened before the attack, like a pooled connection: the flush must reset
+	// it so it reconnects through the proxy.
+	warm := dialEcho(t, ip, echoPort)
+
 	m := metrics.New()
 	engine := fault.NewEngine([]fault.Rule{{Name: "dep", Hosts: []string{allPortsDependency}, Latency: allPortsLatency}})
 	px := startAllPortsProxy(t, engine, m)
 	interceptAllPorts(t, px, ip, "e2e-allports")
+
+	t.Run("connection opened before the attack is reset", func(t *testing.T) {
+		_ = warm.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := warm.Write([]byte{0x00}); err == nil {
+			if _, err = warm.Read(make([]byte, 1)); err == nil {
+				t.Fatal("pre-existing connection still works; the flush did not reset it")
+			}
+		}
+	})
 
 	t.Run("HTTP to the dependency is faulted", func(t *testing.T) {
 		assertDuration(t, func() error { return httpGetHost(ip, httpPort, allPortsDependency) }, allPortsLatency, 0)
@@ -94,15 +107,14 @@ func startAllPortsProxy(t *testing.T, engine *fault.Engine, m *metrics.Metrics) 
 	return uint16(ln.Addr().(*net.TCPAddr).Port)
 }
 
-// interceptAllPorts redirects every port to ip into the proxy. The flush is
-// skipped: these tests are about what reaches the proxy, and the flush's
-// interaction with all-ports capture is tested on its own.
+// interceptAllPorts redirects every port to ip into the proxy, with the flush
+// on. The servers share the host with the clients, so their replies are sent
+// to ip too: a flush that matched replies would break every connection here.
 func interceptAllPorts(t *testing.T, proxyPort uint16, ip, execID string) {
 	t.Helper()
 	cfg := interception.Config{
 		ExecutionID: execID,
 		ProxyPort:   proxyPort,
-		SkipFlush:   true,
 		Filter: interception.Filter{
 			Include:  []netip.Prefix{netip.PrefixFrom(netip.MustParseAddr(ip), 32)},
 			AllPorts: true,
@@ -189,6 +201,16 @@ func echoRoundTrip(ip string, port int, payload []byte) error {
 		return fmt.Errorf("echo = %q, want %q (bytes altered)", got, payload)
 	}
 	return nil
+}
+
+func dialEcho(t *testing.T, ip string, port int) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, fmt.Sprint(port)), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial echo: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
 }
 
 func readGreeting(ip string, port int) error {

@@ -168,9 +168,10 @@ func (c Config) AddScript() []string {
 		if len(c.FlushDestinations) > 0 {
 			flushDsts = includeV4(c.FlushDestinations)
 		}
+		state := c.flushState()
 		for _, in := range flushDsts {
 			for _, pm := range portMatches {
-				s = append(s, fmt.Sprintf("-A %s -p tcp -d %s%s -m conntrack --ctstate ESTABLISHED -j REJECT --reject-with tcp-reset", flush, in, pm))
+				s = append(s, fmt.Sprintf("-A %s -p tcp -d %s%s -m conntrack %s -j REJECT --reject-with tcp-reset", flush, in, pm, state))
 			}
 		}
 		for _, h := range c.hooks() {
@@ -193,6 +194,24 @@ func (c Config) portMatches() []string {
 		out[i] = fmt.Sprintf(" --dport %d", p)
 	}
 	return out
+}
+
+// flushState is the conntrack match selecting the established flows to flush.
+//
+// The flush hooks OUTPUT, which carries every packet the target sends — its
+// own requests and also its replies on connections others opened to it. With
+// explicit ports, --dport keeps those replies out: they go to the peer's
+// ephemeral port. Capturing every port drops --dport, so the flush would reset
+// the target's replies to anyone in the flush destinations for the whole
+// attack (e.g. a dependency that also calls the target, or everyone when the
+// destinations fall back to 0.0.0.0/0). --ctdir ORIGINAL limits it to packets
+// travelling in the direction the connection was opened: connections the
+// target itself opened.
+func (c Config) flushState() string {
+	if c.Filter.AllPorts {
+		return "--ctstate ESTABLISHED --ctdir ORIGINAL"
+	}
+	return "--ctstate ESTABLISHED"
 }
 
 // DeleteCommands returns the individual iptables commands (argv after the
