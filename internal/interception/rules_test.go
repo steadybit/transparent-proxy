@@ -183,9 +183,14 @@ func TestValidate(t *testing.T) {
 }
 
 func TestAddScript_PortScopedKeepsLoopback(t *testing.T) {
-	// Port-scoped capture keeps loopback in scope: no loopback exemption is emitted.
-	if strings.Contains(joined(baseConfig(t).AddScript()), loopbackCIDR) {
-		t.Fatal("port-scoped capture should not add the loopback exemption")
+	// Port-scoped capture keeps loopback in scope: the capture covers every
+	// address (0.0.0.0/0 includes 127.0.0.0/8) and no loopback exemption is emitted.
+	value := joined(baseConfig(t).AddScript())
+	if !strings.Contains(value, "-p tcp -d 0.0.0.0/0 --dport 443 -j REDIRECT") {
+		t.Fatalf("port-scoped capture should cover every address:\n%s", value)
+	}
+	if strings.Contains(value, "-d "+loopbackCIDR+" -j RETURN") {
+		t.Fatalf("port-scoped capture should not exempt loopback:\n%s", value)
 	}
 }
 
