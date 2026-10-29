@@ -196,7 +196,8 @@ func main() {
 			os.Exit(1)
 		}
 		port := uint16(ln.Addr().(*net.TCPAddr).Port)
-		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port, *noFlush, flushDestinations(rules, logger))
+		flushDsts, flushScoped := flushDestinations(rules, logger)
+		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port, skipFlush(*noFlush, flushScoped, flushDsts), flushDsts)
 		if err != nil {
 			logger.Error("invalid interception configuration", slog.Any("err", err))
 			os.Exit(2)
@@ -241,15 +242,17 @@ const (
 // is the right side to err on, since over-flushing resets connections to
 // dependencies the attack never named.
 //
-// Returns nil when no rule targets a hostname, which leaves the flush scoped to
-// the capture filter — what a CIDR-targeted attack actually wants.
-func flushDestinations(rules []fault.Rule, logger *slog.Logger) []netip.Prefix {
+// scoped is false when no rule targets a hostname, which leaves the flush
+// scoped to the capture filter — what a CIDR-targeted attack actually wants.
+// When scoped is true the returned addresses are the complete flush scope, even
+// if empty.
+func flushDestinations(rules []fault.Rule, logger *slog.Logger) (dsts []netip.Prefix, scoped bool) {
 	var hosts []string
 	for _, r := range rules {
 		hosts = append(hosts, r.Hosts...)
 	}
 	if len(hosts) == 0 {
-		return nil
+		return nil, false
 	}
 
 	seen := map[netip.Prefix]bool{}
@@ -278,7 +281,16 @@ func flushDestinations(rules []fault.Rule, logger *slog.Logger) []netip.Prefix {
 	if len(out) == 0 {
 		logger.Warn("no targeted dependency resolved to an IPv4 address; existing connections will not be reset")
 	}
-	return out
+	return out, true
+}
+
+// skipFlush reports whether to leave already-established connections alone.
+// Besides --no-flush, that is the case when the attack targets hostnames but
+// none of them resolved: there is nothing to flush, and falling back to the
+// whole capture filter would reset every established connection it covers —
+// including ones to dependencies the attack never names.
+func skipFlush(noFlush, scoped bool, dsts []netip.Prefix) bool {
+	return noFlush || (scoped && len(dsts) == 0)
 }
 
 func loadRules(path string) ([]fault.Rule, error) {
