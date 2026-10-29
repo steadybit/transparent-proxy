@@ -34,6 +34,11 @@ func baseConfig(t *testing.T) Config {
 
 func joined(s []string) string { return strings.Join(s, "\n") }
 
+// loopbackCIDR is the whole IPv4 loopback range: 127.0.0.1 (localhost) and every
+// other 127.x.x.x address, which the kernel delivers inside the network
+// namespace without ever leaving it.
+const loopbackCIDR = "127.0.0.0/8"
+
 func TestAddScript_Structure(t *testing.T) {
 	c := baseConfig(t)
 	script := joined(c.AddScript())
@@ -179,7 +184,7 @@ func TestValidate(t *testing.T) {
 
 func TestAddScript_PortScopedKeepsLoopback(t *testing.T) {
 	// Port-scoped capture is unchanged: loopback on 80/443 is still in scope.
-	if strings.Contains(joined(baseConfig(t).AddScript()), "127.0.0.0/8") {
+	if strings.Contains(joined(baseConfig(t).AddScript()), loopbackCIDR) {
 		t.Fatal("port-scoped capture should not add the loopback exemption")
 	}
 }
