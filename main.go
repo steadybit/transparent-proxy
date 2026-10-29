@@ -52,7 +52,7 @@ func main() {
 		metricsStdout = flag.Duration("metrics-stdout-interval", 0, "if >0, print a JSON metrics snapshot to stdout at this interval (and once on exit)")
 		maxDuration   = flag.Duration("max-duration", 0, "deadman: self-terminate and tear down after this long (0 disables)")
 		noFlush       = flag.Bool("no-flush", false, "do not reset already-ESTABLISHED connections on start (only new connections are affected)")
-		serverFirst   = flag.Duration("server-first-timeout", 0, "if >0, a client silent this long is presumed to speak a server-first protocol: the upstream is dialed early so its greeting can flow (default: 250ms with --intercept-ports any, otherwise off)")
+		serverFirst   = flag.Duration("server-first-timeout", 0, "if >0, a client silent this long is presumed to speak a server-first protocol: the upstream is dialed early so its greeting can flow (default: 250ms when an empty --intercept-ports captures every port, otherwise off)")
 
 		prePorts = flag.String("preflight-ports", "", "comma-separated target ports to refuse-on-conflict against an existing mesh (defaults to --intercept-ports; with every port intercepted, any existing redirect conflicts)")
 
