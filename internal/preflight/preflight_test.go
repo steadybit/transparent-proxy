@@ -92,6 +92,23 @@ func TestParse_ScopedRedirectPortMatching(t *testing.T) {
 	}
 }
 
+func TestConflictAnyPort(t *testing.T) {
+	// A redirect scoped to a port we would not target still overlaps a
+	// catch-all capture.
+	scoped := Result{Findings: parseFindings(BackendNFT, "nat", `-N MYPROXY
+-A OUTPUT -p tcp -j MYPROXY
+-A MYPROXY -p tcp --dport 8443 -j REDIRECT --to-ports 9000`)}
+	if _, conflict := scoped.Conflict([]uint16{80, 443}); conflict {
+		t.Fatal("precondition: 8443 should not conflict with 80/443")
+	}
+	if _, conflict := scoped.ConflictAnyPort(); !conflict {
+		t.Error("any finding must conflict with an all-ports capture")
+	}
+	if _, conflict := (Result{}).ConflictAnyPort(); conflict {
+		t.Error("a clean namespace must not conflict")
+	}
+}
+
 func TestParse_PortRangeMatching(t *testing.T) {
 	dump := `-N P
 -A OUTPUT -p tcp -j P

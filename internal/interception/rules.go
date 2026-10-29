@@ -36,7 +36,20 @@ type Filter struct {
 	Include []netip.Prefix // destinations to capture (e.g. 0.0.0.0/0 for "any host")
 	Exclude []netip.Prefix // destinations to never touch (agent/platform/self)
 	Ports   []uint16       // target destination ports
+	// AllPorts captures every destination port instead of Ports, so the proxy
+	// can find HTTP/TLS wherever it runs. The proxy still decides per connection
+	// (by Host/SNI) what to fault; everything else is spliced through untouched.
+	// Loopback is never captured in this mode: with no port to narrow it, a
+	// 0.0.0.0/0 include would otherwise pull in every app-to-sidecar and local
+	// database connection.
+	AllPorts bool
 }
+
+// loopbackV4 is the whole IPv4 loopback range: 127.0.0.1 (localhost) and every
+// other 127.x.x.x address, which the kernel delivers inside the network
+// namespace without ever leaving it. It is excluded from capture whenever
+// AllPorts is set, so app-to-sidecar and local database traffic is untouched.
+const loopbackV4 = "127.0.0.0/8"
 
 // Config is a single interception rule set, scoped by ExecutionID.
 type Config struct {
@@ -102,9 +115,12 @@ func (c Config) Validate() error {
 	if len(includeV4(c.Filter.Include)) == 0 {
 		return errors.New("at least one IPv4 include CIDR is required")
 	}
-	if len(c.Filter.Ports) == 0 {
-		// Requiring explicit ports is what prevents an "any host, any port"
-		// catch-all from resetting the whole namespace.
+	if c.Filter.AllPorts && len(c.Filter.Ports) > 0 {
+		return errors.New("target ports and all-ports are mutually exclusive")
+	}
+	if !c.Filter.AllPorts && len(c.Filter.Ports) == 0 {
+		// Requiring explicit ports (or an explicit all-ports opt-in) is what
+		// prevents an accidental "any host, any port" catch-all.
 		return errors.New("at least one target port is required")
 	}
 	return nil
@@ -117,6 +133,10 @@ func (c Config) AddScript() []string {
 	flush := c.flushChain()
 	includes := includeV4(c.Filter.Include)
 	excludes := includeV4(c.Filter.Exclude)
+	if c.Filter.AllPorts {
+		excludes = append(excludes, loopbackV4)
+	}
+	portMatches := c.portMatches()
 
 	var s []string
 
@@ -127,8 +147,8 @@ func (c Config) AddScript() []string {
 		s = append(s, fmt.Sprintf("-A %s -d %s -j RETURN", redir, ex))
 	}
 	for _, in := range includes {
-		for _, p := range c.Filter.Ports {
-			s = append(s, fmt.Sprintf("-A %s -p tcp -d %s --dport %d -j REDIRECT --to-ports %d", redir, in, p, c.ProxyPort))
+		for _, pm := range portMatches {
+			s = append(s, fmt.Sprintf("-A %s -p tcp -d %s%s -j REDIRECT --to-ports %d", redir, in, pm, c.ProxyPort))
 		}
 	}
 	for _, h := range c.hooks() {
@@ -149,8 +169,8 @@ func (c Config) AddScript() []string {
 			flushDsts = includeV4(c.FlushDestinations)
 		}
 		for _, in := range flushDsts {
-			for _, p := range c.Filter.Ports {
-				s = append(s, fmt.Sprintf("-A %s -p tcp -d %s --dport %d -m conntrack --ctstate ESTABLISHED -j REJECT --reject-with tcp-reset", flush, in, p))
+			for _, pm := range portMatches {
+				s = append(s, fmt.Sprintf("-A %s -p tcp -d %s%s -m conntrack --ctstate ESTABLISHED -j REJECT --reject-with tcp-reset", flush, in, pm))
 			}
 		}
 		for _, h := range c.hooks() {
@@ -160,6 +180,19 @@ func (c Config) AddScript() []string {
 	}
 
 	return s
+}
+
+// portMatches returns the --dport fragment for each rule to emit: one per target
+// port, or a single empty fragment (no port match) when AllPorts is set.
+func (c Config) portMatches() []string {
+	if c.Filter.AllPorts {
+		return []string{""}
+	}
+	out := make([]string, len(c.Filter.Ports))
+	for i, p := range c.Filter.Ports {
+		out[i] = fmt.Sprintf(" --dport %d", p)
+	}
+	return out
 }
 
 // DeleteCommands returns the individual iptables commands (argv after the

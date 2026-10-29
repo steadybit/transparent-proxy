@@ -11,6 +11,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -55,6 +56,15 @@ type Server struct {
 	// so server-speaks-first protocols (SMTP, MySQL, ...) don't deadlock the
 	// peek. Defaults to 5s.
 	PeekTimeout time.Duration
+
+	// ServerFirstTimeout, when >0, bounds how long a client may stay silent
+	// before the proxy presumes a server-speaks-first protocol (MySQL, SMTP,
+	// SSH, ...). The upstream is then dialed early so its greeting can flow, and
+	// whichever side speaks first decides: the server → spliced untouched, the
+	// client → sniffed as usual. Zero waits for the client for the whole
+	// PeekTimeout, which stalls server-first protocols for that long — fine when
+	// only HTTP ports are captured, not when every port is.
+	ServerFirstTimeout time.Duration
 
 	// Mark, when non-zero, is stamped as SO_MARK on every upstream socket so the
 	// interception rules can exempt (RETURN) the proxy's own traffic. Without it
@@ -196,17 +206,48 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		proto    = protoOther
 		identity string
 		prefix   []byte
+		// early is an upstream dialed while waiting on a silent client. It is
+		// reused when the connection is forwarded untouched, and closed unused
+		// when a fault applies, so a fault still never depends on it.
+		early *net.TCPConn
 	)
+	defer func() {
+		if early != nil {
+			_ = early.Close()
+		}
+	}()
 	if s.Faults.Inspect(dst) {
+		o, err := s.awaitOpening(ctx, client, dst)
+		early = o.upstream
+		if err != nil {
+			// Uncertain input (timeout / client error): don't guess a rule or
+			// drop — forward untouched (fail open).
+			log.Debug("no client payload to sniff; forwarding untouched",
+				slog.Any("err", err), slog.String("dst", dst.String()))
+			s.forward(ctx, log, client, dst, nil, nil, early)
+			return
+		}
+		if !o.clientSpoke || len(o.fromUpstream) > 0 {
+			// The server spoke first (or neither side did): not a request this
+			// proxy can identify, so splice it untouched.
+			var toUpstream []byte
+			if o.clientSpoke {
+				toUpstream = []byte{o.first}
+			}
+			log.Debug("server-first protocol; forwarding untouched", slog.String("dst", dst.String()))
+			s.forward(ctx, log, client, dst, toUpstream, o.fromUpstream, early)
+			return
+		}
+
 		_ = client.SetReadDeadline(time.Now().Add(s.peekTimeout()))
-		proto, identity, prefix, err = sniff(client)
+		proto, identity, prefix, err = sniffFrom(client, o.first)
 		_ = client.SetReadDeadline(time.Time{})
 		if err != nil {
-			// Uncertain input (timeout / partial / server-first): don't guess a
-			// rule or drop — forward what we read untouched (fail open).
+			// Uncertain input (timeout / partial): don't guess a rule or drop —
+			// forward what we read untouched (fail open).
 			log.Debug("payload sniff inconclusive; forwarding untouched",
 				slog.Any("err", err), slog.String("dst", dst.String()))
-			s.forward(ctx, log, client, dst, prefix)
+			s.forward(ctx, log, client, dst, prefix, nil, early)
 			return
 		}
 	}
@@ -229,6 +270,13 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	// speculatively from the Action — so per-host and global "faulted" counts
 	// stay in step and never over-report (e.g. an HTTP rule on a TLS connection,
 	// which is forwarded untouched). It fires at most once per connection.
+	// A fault never reuses the early upstream: latency is meant to precede the
+	// upstream connection, and an injected response or reset must not depend on
+	// one. Release it now rather than hold it open through a long delay.
+	if early != nil && (action.Abort || action.Latency > 0 || action.HTTPStatus != 0) {
+		_ = early.Close()
+		early = nil
+	}
 	faultRecorded := false
 	markFaulted := func() {
 		if !faultRecorded {
@@ -322,17 +370,23 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		}
 	}
 
-	s.forward(ctx, log, client, dst, prefix)
+	s.forward(ctx, log, client, dst, prefix, nil, early)
 }
 
-// forward dials the upstream, replays any bytes consumed during sniffing, and
-// splices the connection through. Every terminal counter is recorded here.
-func (s *Server) forward(ctx context.Context, log *slog.Logger, client *net.TCPConn, dst netip.AddrPort, prefix []byte) {
-	upstream, err := s.dial(ctx, dst)
-	if err != nil {
-		s.Metrics.UpstreamError()
-		log.Warn("upstream dial failed", slog.Any("err", err))
-		return
+// forward splices the connection through to the upstream — the one given, or a
+// freshly dialed one when nil — after replaying the bytes already consumed from
+// each side: prefix (read from the client while sniffing) and toClient (a
+// server greeting read while waiting on a silent client). Every terminal
+// counter is recorded here.
+func (s *Server) forward(ctx context.Context, log *slog.Logger, client *net.TCPConn, dst netip.AddrPort, prefix, toClient []byte, upstream *net.TCPConn) {
+	if upstream == nil {
+		var err error
+		upstream, err = s.dial(ctx, dst)
+		if err != nil {
+			s.Metrics.UpstreamError()
+			log.Warn("upstream dial failed", slog.Any("err", err))
+			return
+		}
 	}
 	defer func() { _ = upstream.Close() }()
 
@@ -342,11 +396,99 @@ func (s *Server) forward(ctx context.Context, log *slog.Logger, client *net.TCPC
 			return
 		}
 	}
+	if len(toClient) > 0 {
+		if _, err := client.Write(toClient); err != nil {
+			log.Debug("failed to replay upstream greeting", slog.Any("err", err))
+			return
+		}
+	}
 
 	log.Debug("proxying")
-	toUpstream, toClient := relay(client, upstream)
-	s.Metrics.AddBytes(toUpstream+int64(len(prefix)), toClient)
+	sentUp, sentDown := relay(client, upstream)
+	s.Metrics.AddBytes(sentUp+int64(len(prefix)), sentDown+int64(len(toClient)))
 	s.Metrics.Proxied()
+}
+
+// opening is how a connection began: whether the client sent its first byte,
+// and — if the client was silent long enough to dial the upstream early —
+// that upstream and anything it sent first.
+type opening struct {
+	first        byte
+	clientSpoke  bool
+	upstream     *net.TCPConn
+	fromUpstream []byte
+}
+
+// awaitOpening waits for the client's first byte, bounded by the peek timeout.
+//
+// With ServerFirstTimeout set, a client still silent after that long is
+// presumed to be waiting on a server-first protocol. The upstream is then
+// dialed and both sides are raced for the remainder of the peek window: a
+// server greeting ends the wait at once instead of stalling the connection
+// until the peek timeout. If the early dial fails, it just keeps waiting on
+// the client, so the regular forward path reports the upstream error.
+func (s *Server) awaitOpening(ctx context.Context, client *net.TCPConn, dst netip.AddrPort) (opening, error) {
+	defer func() { _ = client.SetReadDeadline(time.Time{}) }()
+	one := make([]byte, 1)
+	start := time.Now()
+	peekDeadline := start.Add(s.peekTimeout())
+
+	if s.ServerFirstTimeout <= 0 || s.ServerFirstTimeout >= s.peekTimeout() {
+		_ = client.SetReadDeadline(peekDeadline)
+		if _, err := io.ReadFull(client, one); err != nil {
+			return opening{}, err
+		}
+		return opening{first: one[0], clientSpoke: true}, nil
+	}
+
+	_ = client.SetReadDeadline(start.Add(s.ServerFirstTimeout))
+	_, err := io.ReadFull(client, one)
+	if err == nil {
+		return opening{first: one[0], clientSpoke: true}, nil
+	}
+	if !isTimeout(err) {
+		return opening{}, err
+	}
+
+	upstream, derr := s.dial(ctx, dst)
+	if derr != nil {
+		_ = client.SetReadDeadline(peekDeadline)
+		if _, err := io.ReadFull(client, one); err != nil {
+			return opening{}, err
+		}
+		return opening{first: one[0], clientSpoke: true}, nil
+	}
+
+	greeting := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		n, _ := upstream.Read(buf)
+		if n > 0 {
+			// Wake the client read below: the server spoke first.
+			_ = client.SetReadDeadline(time.Now())
+		}
+		greeting <- buf[:n]
+	}()
+
+	_ = client.SetReadDeadline(peekDeadline)
+	_, cerr := io.ReadFull(client, one)
+	// Stop the upstream probe if it is still waiting, then reclaim the conn.
+	_ = upstream.SetReadDeadline(time.Now())
+	o := opening{upstream: upstream, fromUpstream: <-greeting}
+	_ = upstream.SetReadDeadline(time.Time{})
+
+	if cerr == nil {
+		o.first, o.clientSpoke = one[0], true
+	} else if !isTimeout(cerr) && len(o.fromUpstream) == 0 {
+		// The client failed or went away before either side spoke.
+		return o, cerr
+	}
+	return o, nil
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func (s *Server) dial(ctx context.Context, dst netip.AddrPort) (*net.TCPConn, error) {

@@ -52,11 +52,12 @@ func main() {
 		metricsStdout = flag.Duration("metrics-stdout-interval", 0, "if >0, print a JSON metrics snapshot to stdout at this interval (and once on exit)")
 		maxDuration   = flag.Duration("max-duration", 0, "deadman: self-terminate and tear down after this long (0 disables)")
 		noFlush       = flag.Bool("no-flush", false, "do not reset already-ESTABLISHED connections on start (only new connections are affected)")
+		serverFirst   = flag.Duration("server-first-timeout", 0, "if >0, a client silent this long is presumed to speak a server-first protocol: the upstream is dialed early so its greeting can flow (default: 250ms with --intercept-ports any, otherwise off)")
 
-		prePorts = flag.String("preflight-ports", "", "comma-separated target ports to refuse-on-conflict against an existing mesh (defaults to --intercept-ports)")
+		prePorts = flag.String("preflight-ports", "", "comma-separated target ports to refuse-on-conflict against an existing mesh (defaults to --intercept-ports; with every port intercepted, any existing redirect conflicts)")
 
 		interceptCIDRs = flag.String("intercept-cidrs", "", "comma-separated destination CIDRs to capture; enables self-managed interception")
-		interceptPorts = flag.String("intercept-ports", "", "comma-separated destination ports to capture (required with --intercept-cidrs)")
+		interceptPorts = flag.String("intercept-ports", "", "comma-separated destination ports to capture; empty with --intercept-cidrs captures every port (loopback excepted)")
 		excludeCIDRs   = flag.String("exclude-cidrs", "", "comma-separated destinations never to touch (agent/platform)")
 		execID         = flag.String("exec-id", "default", "execution id used to name the interception chains")
 
@@ -106,14 +107,6 @@ func main() {
 	defer stop()
 
 	m := metrics.New()
-	srv := &proxy.Server{
-		Listen:      *listen,
-		Faults:      fault.NewEngine(rules),
-		Logger:      logger,
-		DialTimeout: *dialTimeout,
-		Mark:        uint32(*mark),
-		Metrics:     m,
-	}
 
 	// The metrics endpoint runs for the whole process lifetime.
 	if *metricsAddr != "" {
@@ -134,13 +127,24 @@ func main() {
 		logger.Error("invalid interception configuration", slog.Any("err", err))
 		os.Exit(2)
 	}
+	allPorts := wantIntercept && interceptsAllPorts(*interceptPorts)
+
+	srv := &proxy.Server{
+		Listen:             *listen,
+		Faults:             fault.NewEngine(rules),
+		Logger:             logger,
+		DialTimeout:        *dialTimeout,
+		ServerFirstTimeout: serverFirstTimeout(*serverFirst, flagSet("server-first-timeout"), allPorts),
+		Mark:               uint32(*mark),
+		Metrics:            m,
+	}
 
 	// Out-of-band teardown: remove the rules and exit. An orchestrator calls
 	// this (with the same exec-id/filter) to guarantee cleanup even if a prior
 	// self-managed process was SIGKILLed and its in-process Guard never ran.
 	if *revert {
 		if !wantIntercept {
-			logger.Error("--revert requires --intercept-cidrs and --intercept-ports")
+			logger.Error("--revert requires --intercept-cidrs")
 			os.Exit(2)
 		}
 		if err := interceptor.Revert(ctx); err != nil {
@@ -169,13 +173,14 @@ func main() {
 	}
 
 	// Preflight: refuse to fight an existing mesh proxy. Ports default to the
-	// intercept ports when not given explicitly.
-	preflightSpec := *prePorts
-	if preflightSpec == "" {
-		preflightSpec = *interceptPorts
-	}
-	if preflightSpec != "" {
-		if err := runPreflight(ctx, logger, preflightSpec); err != nil {
+	// intercept ports when not given explicitly; when every port is
+	// intercepted, any existing redirect conflicts.
+	if *prePorts != "" || wantIntercept {
+		spec := *prePorts
+		if spec == "" {
+			spec = *interceptPorts
+		}
+		if err := runPreflight(ctx, logger, spec, *prePorts == "" && allPorts); err != nil {
 			logger.Error("preflight refusal", slog.Any("err", err))
 			os.Exit(1)
 		}
@@ -198,7 +203,8 @@ func main() {
 		}
 		guard := &supervisor.Guard{Interceptor: interceptor, Logger: logger, MaxDuration: *maxDuration}
 		logger.Info("starting with self-managed interception (fail-open)",
-			slog.String("exec_id", *execID), slog.Int("proxy_port", int(port)))
+			slog.String("exec_id", *execID), slog.Int("proxy_port", int(port)),
+			slog.Bool("all_ports", allPorts), slog.Duration("server_first_timeout", srv.ServerFirstTimeout))
 		err = guard.Run(ctx, func(ctx context.Context) error { return srv.Serve(ctx, ln) })
 	} else {
 		runCtx := ctx
@@ -409,8 +415,9 @@ func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyP
 	if cidrs == "" && ports == "" {
 		return nil, false, nil
 	}
-	if cidrs == "" || ports == "" {
-		return nil, false, errors.New("--intercept-cidrs and --intercept-ports must be set together")
+	// Ports without CIDRs is a mistake; CIDRs without ports captures every port.
+	if cidrs == "" {
+		return nil, false, errors.New("--intercept-ports requires --intercept-cidrs")
 	}
 
 	include, err := parseCIDRs(cidrs)
@@ -421,9 +428,12 @@ func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyP
 	if err != nil {
 		return nil, false, fmt.Errorf("exclude-cidrs: %w", err)
 	}
-	tcpPorts, err := parsePorts(ports)
-	if err != nil {
-		return nil, false, fmt.Errorf("intercept-ports: %w", err)
+	allPorts := interceptsAllPorts(ports)
+	var tcpPorts []uint16
+	if !allPorts {
+		if tcpPorts, err = parsePorts(ports); err != nil {
+			return nil, false, fmt.Errorf("intercept-ports: %w", err)
+		}
 	}
 
 	cfg := interception.Config{
@@ -433,24 +443,34 @@ func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyP
 		SkipFlush:         noFlush,
 		FlushDestinations: flushDsts,
 		Filter: interception.Filter{
-			Include: include,
-			Exclude: exclude,
-			Ports:   tcpPorts,
+			Include:  include,
+			Exclude:  exclude,
+			Ports:    tcpPorts,
+			AllPorts: allPorts,
 		},
 	}
 	return interceptorAdapter{cfg: cfg, runner: interception.ExecRunner{}}, true, nil
 }
 
-func runPreflight(ctx context.Context, logger *slog.Logger, spec string) error {
-	ports, err := parsePorts(spec)
-	if err != nil {
-		return fmt.Errorf("invalid preflight ports: %w", err)
+// runPreflight refuses when an existing mesh proxy captures any of the ports in
+// spec — or, with allPorts, when any existing redirect exists at all.
+func runPreflight(ctx context.Context, logger *slog.Logger, spec string, allPorts bool) error {
+	var ports []uint16
+	if !allPorts {
+		var err error
+		if ports, err = parsePorts(spec); err != nil {
+			return fmt.Errorf("invalid preflight ports: %w", err)
+		}
 	}
 	res, err := preflight.Detect(ctx, interception.ExecRunner{})
 	if err != nil {
 		return fmt.Errorf("preflight scan failed; cannot verify the namespace is clear: %w", err)
 	}
-	if f, conflict := res.Conflict(ports); conflict {
+	f, conflict := res.Conflict(ports)
+	if allPorts {
+		f, conflict = res.ConflictAnyPort()
+	}
+	if conflict {
 		return errors.New(f.Message())
 	}
 	logger.Info("preflight clean", slog.Any("backends", res.Backends))
@@ -508,6 +528,45 @@ func parseCIDRs(s string) ([]netip.Prefix, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// defaultServerFirstTimeout is how long a client may stay silent before it is
+// presumed to be waiting on a server-first protocol. HTTP and TLS clients send
+// their first bytes immediately after connecting, so this only affects them
+// for connections opened ahead of use (pre-warmed pools).
+const defaultServerFirstTimeout = 250 * time.Millisecond
+
+// serverFirstTimeout picks the proxy's ServerFirstTimeout. An explicit
+// --server-first-timeout always wins. Otherwise it is enabled only when every
+// port is captured: that also captures server-speaks-first protocols (MySQL,
+// SMTP, SSH, ...), which would stall for the whole peek timeout waiting for a
+// client that never speaks first. With explicit ports (typically 80/443) only
+// client-first HTTP/TLS is captured, so it stays off.
+func serverFirstTimeout(flagValue time.Duration, explicit, allPorts bool) time.Duration {
+	if explicit || !allPorts {
+		return flagValue
+	}
+	return defaultServerFirstTimeout
+}
+
+// interceptsAllPorts reports whether an --intercept-ports value (given
+// alongside --intercept-cidrs) means every port. Only an empty value does —
+// what an orchestrator sends for "no ports". Anything else is parsed as a port
+// list, so a malformed one such as " , " fails instead of silently becoming a
+// catch-all.
+func interceptsAllPorts(s string) bool {
+	return s == ""
+}
+
+// flagSet reports whether the named flag was given on the command line.
+func flagSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 func parsePorts(s string) ([]uint16, error) {
