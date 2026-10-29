@@ -85,15 +85,11 @@ func sniffHTTP(c net.Conn, first byte) (protocol, string, []byte, error) {
 		// with an uppercase letter (Redis inline "PING", NATS "CONNECT {...}")
 		// never sends — which would stall it for the whole peek timeout.
 		if requestLine {
-			if !plausibleRequestLine(buf) {
+			complete, ok := checkRequestLine(buf)
+			if !ok {
 				return protoOther, "", buf, nil
 			}
-			if bytes.HasSuffix(buf, []byte("\r\n")) {
-				requestLine = false
-				if !isHTTP1RequestLine(string(buf[:len(buf)-2])) {
-					return protoOther, "", buf, nil
-				}
-			}
+			requestLine = !complete
 		}
 		if bytes.HasSuffix(buf, []byte("\r\n\r\n")) {
 			host, ok := parseHTTPHead(buf)
@@ -142,6 +138,20 @@ func hostWithoutPort(h string) string {
 // maxMethodLen bounds the method token; the longest registered methods
 // (e.g. "VERSION-CONTROL") are well under it.
 const maxMethodLen = 20
+
+// checkRequestLine inspects buf, the start of the head read so far, while the
+// request line is still being read. ok is false as soon as buf can no longer
+// be an HTTP/1.x request line; complete is true once the whole line (up to its
+// CRLF) has been read and is valid, so it needs no further checking.
+func checkRequestLine(buf []byte) (complete, ok bool) {
+	if !plausibleRequestLine(buf) {
+		return false, false
+	}
+	if !bytes.HasSuffix(buf, []byte("\r\n")) {
+		return false, true
+	}
+	return true, isHTTP1RequestLine(string(buf[:len(buf)-2]))
+}
 
 // plausibleRequestLine reports whether b, the request line read so far, can
 // still become an HTTP request line: a method token of uppercase letters, '-'
