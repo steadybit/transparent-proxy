@@ -166,10 +166,11 @@ func TestValidate(t *testing.T) {
 	}
 
 	cases := map[string]func(*Config){
-		"no proxy port": func(c *Config) { c.ProxyPort = 0 },
-		"no includes":   func(c *Config) { c.Filter.Include = nil },
-		"no ports":      func(c *Config) { c.Filter.Ports = nil },
-		"only ipv6":     func(c *Config) { c.Filter.Include = []netip.Prefix{mustPrefix(t, "2001:db8::/32")} },
+		"no proxy port":       func(c *Config) { c.ProxyPort = 0 },
+		"no includes":         func(c *Config) { c.Filter.Include = nil },
+		"no ports":            func(c *Config) { c.Filter.Ports = nil },
+		"ports and all-ports": func(c *Config) { c.Filter.AllPorts = true },
+		"only ipv6":           func(c *Config) { c.Filter.Include = []netip.Prefix{mustPrefix(t, "2001:db8::/32")} },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -179,6 +180,34 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("expected %s to be rejected", name)
 			}
 		})
+	}
+}
+
+func TestAddScript_AllPorts(t *testing.T) {
+	c := baseConfig(t)
+	c.Filter.Ports = nil
+	c.Filter.AllPorts = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("all-ports config rejected: %v", err)
+	}
+	script := joined(c.AddScript())
+
+	for _, want := range []string{
+		"-A SB_TP_REDIR_execid123456 -d " + loopbackCIDR + " -j RETURN",
+		"-A SB_TP_REDIR_execid123456 -p tcp -d 0.0.0.0/0 -j REDIRECT --to-ports 3128",
+		"-A SB_TP_FLUSH_execid123456 -d " + loopbackCIDR + " -j RETURN",
+		"-A SB_TP_FLUSH_execid123456 -p tcp -d 0.0.0.0/0 -m conntrack --ctstate ESTABLISHED --ctdir ORIGINAL -j REJECT --reject-with tcp-reset",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("AddScript missing line:\n  %s\nfull script:\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, "--dport") {
+		t.Errorf("all-ports script must not match on a port:\n%s", script)
+	}
+	// The loopback exemption must precede the catch-all REDIRECT to take effect.
+	if strings.Index(script, "-d "+loopbackCIDR+" -j RETURN") > strings.Index(script, "-j REDIRECT") {
+		t.Errorf("loopback exemption must come before the REDIRECT:\n%s", script)
 	}
 }
 

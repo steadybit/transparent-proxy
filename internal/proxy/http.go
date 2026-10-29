@@ -35,14 +35,18 @@ func sniff(c net.Conn) (proto protocol, identity string, consumed []byte, err er
 	if _, err := io.ReadFull(c, first); err != nil {
 		return protoOther, "", nil, err
 	}
+	return sniffFrom(c, first[0])
+}
 
+// sniffFrom is sniff for a connection whose first byte was already read.
+func sniffFrom(c net.Conn, first byte) (proto protocol, identity string, consumed []byte, err error) {
 	switch {
-	case first[0] == tlsHandshakeRecord:
-		return sniffTLS(c, first[0])
-	case isHTTPMethodStart(first[0]):
-		return sniffHTTP(c, first[0])
+	case first == tlsHandshakeRecord:
+		return sniffTLS(c, first)
+	case isHTTPMethodStart(first):
+		return sniffHTTP(c, first)
 	default:
-		return protoOther, "", first, nil
+		return protoOther, "", []byte{first}, nil
 	}
 }
 

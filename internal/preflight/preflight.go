@@ -129,6 +129,15 @@ func (r Result) Conflict(targetPorts []uint16) (Finding, bool) {
 	return Finding{}, false
 }
 
+// ConflictAnyPort reports the first finding when capturing every port: any
+// existing REDIRECT/TPROXY, whatever ports it scopes, overlaps a catch-all.
+func (r Result) ConflictAnyPort() (Finding, bool) {
+	if len(r.Findings) > 0 {
+		return r.Findings[0], true
+	}
+	return Finding{}, false
+}
+
 // BackendGeneric is the fallback probed via the plain `iptables` binary on
 // hosts (Alpine, slim containers) that ship no legacy/nft variant symlinks.
 const BackendGeneric Backend = "generic"
