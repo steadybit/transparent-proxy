@@ -76,3 +76,24 @@ func Test_writeHTTPResponse_customBodyAndHeaders(t *testing.T) {
 		t.Fatalf("Content-Length = %q, want %d", got, len(body))
 	}
 }
+
+func TestCheckRequestLine(t *testing.T) {
+	cases := []struct {
+		buf          string
+		complete, ok bool
+	}{
+		{buf: "G", complete: false, ok: true},
+		{buf: "GET /x HTTP/1", complete: false, ok: true},
+		{buf: "GET /x HTTP/1.1\r\n", complete: true, ok: true},
+		{buf: "PING\r", complete: false, ok: false},                         // line break before the method ends
+		{buf: "Get", complete: false, ok: false},                            // lowercase method
+		{buf: "CONNECT {\"verbose\":false}\r\n", complete: true, ok: false}, // not METHOD target HTTP/1.x
+		{buf: "PRI * HTTP/2.0\r\n", complete: true, ok: false},              // HTTP/2 preface
+	}
+	for _, tc := range cases {
+		complete, ok := checkRequestLine([]byte(tc.buf))
+		if complete != tc.complete || ok != tc.ok {
+			t.Errorf("checkRequestLine(%q) = (complete=%v, ok=%v), want (%v, %v)", tc.buf, complete, ok, tc.complete, tc.ok)
+		}
+	}
+}
