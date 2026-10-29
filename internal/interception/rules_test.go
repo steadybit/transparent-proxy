@@ -183,7 +183,7 @@ func TestValidate(t *testing.T) {
 }
 
 func TestAddScript_PortScopedKeepsLoopback(t *testing.T) {
-	// Port-scoped capture is unchanged: loopback on 80/443 is still in scope.
+	// Port-scoped capture keeps loopback in scope: no loopback exemption is emitted.
 	if strings.Contains(joined(baseConfig(t).AddScript()), loopbackCIDR) {
 		t.Fatal("port-scoped capture should not add the loopback exemption")
 	}

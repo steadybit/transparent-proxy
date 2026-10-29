@@ -89,7 +89,7 @@ func TestSniff_OpaqueProtocol(t *testing.T) {
 
 // TestSniff_UppercaseTextProtocolsAreNotHeldAsHTTP proves client-first text
 // protocols that merely start with an uppercase letter are classified opaque
-// as soon as their first line rules out HTTP — not after the peek timeout.
+// without waiting for the peek timeout.
 func TestSniff_UppercaseTextProtocolsAreNotHeldAsHTTP(t *testing.T) {
 	for name, payload := range map[string]string{
 		"h2 preface": "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
@@ -98,8 +98,8 @@ func TestSniff_UppercaseTextProtocolsAreNotHeldAsHTTP(t *testing.T) {
 			client, server := net.Pipe()
 			defer client.Close()
 			defer server.Close()
-			// Write the payload but never close or send a blank line: a sniff
-			// that waited for one would hit the deadline below.
+			// Write the payload but never close the pipe: a sniff that waited
+			// for more than the payload provides would hit the deadline below.
 			go func() { _, _ = client.Write([]byte(payload)) }()
 
 			_ = server.SetReadDeadline(time.Now().Add(time.Second))
