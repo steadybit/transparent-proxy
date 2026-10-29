@@ -92,7 +92,10 @@ func TestSniff_OpaqueProtocol(t *testing.T) {
 // without waiting for the peek timeout.
 func TestSniff_UppercaseTextProtocolsAreNotHeldAsHTTP(t *testing.T) {
 	for name, payload := range map[string]string{
-		"h2 preface": "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+		"redis inline": "PING\r\n",
+		"nats connect": "CONNECT {\"verbose\":false}\r\n",
+		"h2 preface":   "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+		"lowercase":    "Get / HTTP/1.1\r\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			client, server := net.Pipe()
