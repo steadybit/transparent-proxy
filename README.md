@@ -89,7 +89,7 @@ selectors match — an empty selector means "any".
 - `abort` — reset (RST) the connection.
 - `httpStatus` — synthesize this HTTP status (L7). Cleartext HTTP always; HTTPS
   only with an interception CA (see below).
-- `probability` — `[0,1]` chance to apply the fault per connection (`0`/unset = always).
+- `probability` — `[0,1]` chance to apply the fault per connection (unset = always, `0` = never).
 
 ## HTTPS response injection
 

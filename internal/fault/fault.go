@@ -129,43 +129,49 @@ func (e *Engine) Inspect(dst netip.AddrPort) bool {
 }
 
 // Match returns the Action for a connection to dst with the given identity
-// (a TLS SNI or an HTTP Host header; empty if unknown). The zero Action means
-// "proxy through untouched".
+// (a TLS SNI or an HTTP Host header; empty if unknown), rolling the rule's
+// probability once. The zero Action means "proxy through untouched".
 func (e *Engine) Match(dst netip.AddrPort, identity string) Action {
+	r, ok := e.Lookup(dst, identity)
+	if !ok {
+		return Action{}
+	}
+	return r.DecideAction()
+}
+
+// Lookup returns the first rule matching dst and identity, without rolling its
+// probability. Callers that see several requests on one connection look the
+// rule up once and call DecideAction per request.
+func (e *Engine) Lookup(dst netip.AddrPort, identity string) (Rule, bool) {
 	for _, r := range e.rules {
-		if !cidrsMatch(r.CIDRs, dst.Addr()) {
-			continue
-		}
-		if !hostsMatch(r.Hosts, identity) {
-			continue
-		}
-		// Probability roll gates the fault. A matched-but-not-faulted connection
-		// still returns the rule name (so it's counted) but carries no fault, so
-		// it is proxied through untouched. Top-level rand.Float64 is safe for
-		// concurrent use and independent across restarts.
-		//
-		// Unset (nil) means always; an explicit 0 means never; anything else is
-		// rolled. So a nil default doesn't accidentally read as "never".
-		p := 1.0
-		if r.Probability != nil {
-			p = *r.Probability
-		}
-		if p <= 0 {
-			return Action{Rule: r.Name}
-		}
-		if p < 1.0 && rand.Float64() >= p {
-			return Action{Rule: r.Name}
-		}
-		return Action{
-			Rule:        r.Name,
-			Latency:     r.Latency,
-			Abort:       r.Abort,
-			HTTPStatus:  r.HTTPStatus,
-			HTTPBody:    r.HTTPBody,
-			HTTPHeaders: r.HTTPHeaders,
+		if cidrsMatch(r.CIDRs, dst.Addr()) && hostsMatch(r.Hosts, identity) {
+			return r, true
 		}
 	}
-	return Action{}
+	return Rule{}, false
+}
+
+// DecideAction returns the rule's fault if it happens this time. Otherwise the
+// Action carries only the rule name (so it's counted) and the traffic is
+// proxied through untouched. An unset probability means always.
+func (r Rule) DecideAction() Action {
+	if r.Probability != nil && !rollChance(*r.Probability) {
+		return Action{Rule: r.Name}
+	}
+	return Action{
+		Rule:        r.Name,
+		Latency:     r.Latency,
+		Abort:       r.Abort,
+		HTTPStatus:  r.HTTPStatus,
+		HTTPBody:    r.HTTPBody,
+		HTTPHeaders: r.HTTPHeaders,
+	}
+}
+
+// rollChance reports whether an event with probability p happens. rand.Float64
+// is in [0,1), so p <= 0 never happens and p >= 1 always does.
+func rollChance(p float64) bool {
+	return rand.Float64() < p
 }
 
 func cidrsMatch(cidrs []netip.Prefix, ip netip.Addr) bool {

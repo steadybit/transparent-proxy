@@ -252,10 +252,10 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		}
 	}
 
-	action := s.Faults.Match(dst, identity)
+	rule, matched := s.Faults.Lookup(dst, identity)
 	log = log.With(
 		slog.String("dst", dst.String()),
-		slog.String("rule", action.Rule),
+		slog.String("rule", rule.Name),
 	)
 	// identity (the TLS SNI or HTTP Host) is potentially sensitive, so it is
 	// only ever logged at debug — never at the info level that ships by default
@@ -263,8 +263,21 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	if identity != "" {
 		log.Debug("matched dependency", slog.String("identity", identity))
 	}
-	if action.Rule != "" {
+	if matched {
 		s.Metrics.MatchedHost(identity)
+	}
+
+	// Cleartext HTTP is handled request by request, so the rule's probability
+	// applies to each request rather than once for the whole connection.
+	if matched && proto == protoHTTP {
+		s.serveHTTP(ctx, log, client, dst, identity, prefix, early)
+		early = nil
+		return
+	}
+
+	var action fault.Action
+	if matched {
+		action = rule.DecideAction()
 	}
 	// faulted is recorded at the point a fault actually applies — not
 	// speculatively from the Action — so per-host and global "faulted" counts
@@ -306,21 +319,12 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	}
 
 	// L7: synthesize an HTTP status response without contacting the upstream.
-	// Cleartext HTTP is written directly. HTTPS is only decrypted when a CA is
-	// configured and the client offered an SNI to mint a certificate for;
-	// otherwise the connection falls through and is spliced untouched, which is
-	// the pre-CA behaviour.
+	// Cleartext HTTP never gets here (see serveHTTP). HTTPS is only decrypted
+	// when a CA is configured and the client offered an SNI to mint a
+	// certificate for; otherwise the connection falls through and is spliced
+	// untouched, which is the pre-CA behaviour.
 	if action.HTTPStatus != 0 {
 		switch {
-		case proto == protoHTTP:
-			markFaulted()
-			if err := writeHTTPResponse(client, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody); err != nil {
-				log.Debug("failed to write injected status", slog.Any("err", err))
-			}
-			s.Metrics.HTTPInjected()
-			log.Info("injected http status", slog.Int("status", action.HTTPStatus))
-			return
-
 		case proto == protoTLS && s.TLSInject != nil && identity != "":
 			// Counted from the delivery callback, not after ServeForged returns: an
 			// HTTP/2 client keeps the connection pooled for the whole attack, so
