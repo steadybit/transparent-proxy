@@ -130,12 +130,13 @@ func isHTTPMethodStart(b byte) bool {
 	return b >= 'A' && b <= 'Z'
 }
 
-// writeHTTPResponse synthesizes a cleartext HTTP response — an injected fault
-// that never reaches the upstream. body, if empty, falls back to a default
+// writeHTTPResponse synthesizes a cleartext HTTP response to req — an injected
+// fault that never reaches the upstream. body, if empty, falls back to a default
 // one-liner. Caller headers are added as-is (their Content-Type overrides the
 // default); Content-Length and Connection are always set by the proxy so the
-// framing stays correct and the connection is kept alive only when asked.
-func writeHTTPResponse(c net.Conn, status int, headers map[string]string, body string, keepAlive bool) error {
+// framing stays correct. The connection is kept alive unless req asked to
+// close it, and a HEAD request gets the headers without the body.
+func writeHTTPResponse(c net.Conn, req *http.Request, status int, headers map[string]string, body string) error {
 	// Normalised the same way as the HTTPS path, so one rule produces the same
 	// response whether the matched dependency happened to be HTTP or HTTPS. 1xx
 	// is informational and cannot carry a fault; 204/304 must not carry a body.
@@ -162,9 +163,9 @@ func writeHTTPResponse(c net.Conn, status int, headers map[string]string, body s
 	if !noBody {
 		h["Content-Length"] = strconv.Itoa(len(body))
 	}
-	h["Connection"] = "close"
-	if keepAlive {
-		h["Connection"] = "keep-alive"
+	h["Connection"] = "keep-alive"
+	if req.Close {
+		h["Connection"] = "close"
 	}
 
 	var sb strings.Builder
@@ -173,8 +174,19 @@ func writeHTTPResponse(c net.Conn, status int, headers map[string]string, body s
 		fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
 	}
 	sb.WriteString("\r\n")
-	sb.WriteString(body)
+	writeBody(&sb, req, body)
 
 	_, err := c.Write([]byte(sb.String()))
 	return err
+}
+
+// writeBody appends body to the response, unless req is a HEAD request. A HEAD
+// response announces the body's length but never carries it: the client stops
+// reading after the headers, so a body would be left on the connection and
+// read as the start of the next response.
+func writeBody(sb *strings.Builder, req *http.Request, body string) {
+	if req.Method == http.MethodHead {
+		return
+	}
+	sb.WriteString(body)
 }

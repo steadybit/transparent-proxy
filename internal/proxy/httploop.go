@@ -109,7 +109,7 @@ func (c *httpConn) serve(ctx context.Context, req *http.Request) bool {
 		c.markFaulted()
 		// The body must be consumed so the next request starts at its head.
 		_, _ = io.Copy(io.Discard, req.Body)
-		if err := writeHTTPResponse(c.client, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody, !req.Close); err != nil {
+		if err := writeHTTPResponse(c.client, req, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody); err != nil {
 			c.log.Debug("failed to write injected status", slog.Any("err", err))
 			return false
 		}
