@@ -18,7 +18,7 @@ func readSynthesized(t *testing.T, status int, headers map[string]string, body s
 	t.Helper()
 	srv, cli := net.Pipe()
 	go func() {
-		_ = writeHTTPResponse(srv, status, headers, body)
+		_ = writeHTTPResponse(srv, status, headers, body, false)
 		_ = srv.Close()
 	}()
 	resp, err := http.ReadResponse(bufio.NewReader(cli), nil)
