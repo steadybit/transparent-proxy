@@ -194,3 +194,36 @@ func TestFirstMatchWins(t *testing.T) {
 		t.Fatalf("got %+v, want first rule to win", got)
 	}
 }
+
+func TestLookup_DoesNotRoll(t *testing.T) {
+	// A rule that never fires is still found: Lookup only selects, DecideAction decides.
+	e := NewEngine([]Rule{{Name: "never", Hosts: []string{"x.com"}, Abort: true, Probability: prob(0)}})
+
+	r, ok := e.Lookup(addrPort(t, "1.1.1.1:80"), "x.com")
+	if !ok || r.Name != "never" {
+		t.Fatalf("Lookup = %+v, %v; want rule never", r, ok)
+	}
+	if _, ok := e.Lookup(addrPort(t, "1.1.1.1:80"), "other.com"); ok {
+		t.Fatal("Lookup should not match another host")
+	}
+}
+
+func TestDecideAction_DecidesEachCall(t *testing.T) {
+	// The same rule decided repeatedly must yield both outcomes, which is what lets
+	// a caller apply the probability per request instead of per connection.
+	r := Rule{Name: "half", HTTPStatus: 503, Probability: prob(0.5)}
+
+	faulted := 0
+	for i := 0; i < 1000; i++ {
+		a := r.DecideAction()
+		if a.Rule != "half" {
+			t.Fatalf("DecideAction should always report the rule, got %q", a.Rule)
+		}
+		if a.HTTPStatus == 503 {
+			faulted++
+		}
+	}
+	if faulted < 400 || faulted > 600 {
+		t.Fatalf("probability 0.5 faulted %d/1000, want about 500", faulted)
+	}
+}
