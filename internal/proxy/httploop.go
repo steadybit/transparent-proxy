@@ -123,6 +123,11 @@ func (c *httpConn) serve(ctx context.Context, req *http.Request) bool {
 
 // forward sends req to the upstream and streams its response back.
 func (c *httpConn) forward(ctx context.Context, req *http.Request) bool {
+	// Servers close idle keep-alive connections on their side. Writing into one
+	// would fail this request, so a closed upstream is replaced first.
+	if c.upstream != nil && !c.upstreamReusable() {
+		c.closeUpstream()
+	}
 	if c.upstream == nil {
 		up, err := c.s.dial(ctx, c.dst)
 		if err != nil {
@@ -181,6 +186,14 @@ func (c *httpConn) closeUpstream() {
 	if c.upstream != nil {
 		_ = c.upstream.Close()
 	}
+	c.upstream, c.upstreamR = nil, nil
+}
+
+// upstreamReusable reports whether the kept upstream connection can carry the
+// next request: nothing left unread in our buffer, and still open on the
+// server's side.
+func (c *httpConn) upstreamReusable() bool {
+	return c.upstreamR.Buffered() == 0 && idleConnAlive(c.upstream)
 }
 
 // markFaulted records the connection as faulted, once.

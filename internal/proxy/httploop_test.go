@@ -49,6 +49,58 @@ func TestServeHTTP_HeadKeepsConnectionUsable(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_ReconnectsWhenUpstreamClosedIdleConnection forwards two requests
+// on one client connection to an upstream that closes its side after every
+// response, like a server whose idle timeout expired. The second request must
+// go over a new upstream connection instead of failing.
+func TestServeHTTP_ReconnectsWhenUpstreamClosedIdleConnection(t *testing.T) {
+	const host = "dependency.test"
+
+	upstream := startClosingUpstream(t)
+	proxyAddr := startProxy(t, upstream, fault.NewEngine([]fault.Rule{
+		statusRule(host, 0, http.StatusServiceUnavailable),
+	}))
+	conn := dialRaw(t, proxyAddr)
+
+	if resp := conn.roundTrip(t, http.MethodGet, host); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first GET status = %d, want 200", resp.StatusCode)
+	}
+	// Give the upstream's close time to arrive, as it would for a connection
+	// that sat idle in a pool.
+	time.Sleep(50 * time.Millisecond)
+	if resp := conn.roundTrip(t, http.MethodGet, host); resp.StatusCode != http.StatusOK {
+		t.Fatalf("second GET status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// startClosingUpstream starts an HTTP server that answers one request per
+// connection with 200 "ok" and then closes the connection, without announcing
+// it with "Connection: close".
+func startClosingUpstream(t *testing.T) netip.AddrPort {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen upstream: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = c.Close() }()
+				if _, err := http.ReadRequest(bufio.NewReader(c)); err != nil {
+					return
+				}
+				_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+			}()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).AddrPort()
+}
+
 // rawConn is one client connection to the proxy, used for sending requests in
 // sequence and reading their responses, so a test controls exactly what goes
 // over a single keep-alive connection.
