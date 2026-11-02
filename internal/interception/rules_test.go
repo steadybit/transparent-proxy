@@ -171,6 +171,7 @@ func TestValidate(t *testing.T) {
 		"no ports":            func(c *Config) { c.Filter.Ports = nil },
 		"ports and all-ports": func(c *Config) { c.Filter.AllPorts = true },
 		"only ipv6":           func(c *Config) { c.Filter.Include = []netip.Prefix{mustPrefix(t, "2001:db8::/32")} },
+		"only loopback":       func(c *Config) { c.Filter.Include = []netip.Prefix{mustPrefix(t, "127.0.0.1/32")} },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -180,6 +181,15 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("expected %s to be rejected", name)
 			}
 		})
+	}
+}
+
+func TestValidate_LoopbackIncludeWithLoopback(t *testing.T) {
+	c := baseConfig(t)
+	c.Filter.Include = []netip.Prefix{mustPrefix(t, "127.0.0.1/32")}
+	c.Filter.Loopback = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("loopback include with Loopback rejected: %v", err)
 	}
 }
 
@@ -211,15 +221,72 @@ func TestAddScript_AllPorts(t *testing.T) {
 	}
 }
 
-func TestAddScript_PortScopedKeepsLoopback(t *testing.T) {
-	// Port-scoped capture keeps loopback in scope: the capture covers every
-	// address (0.0.0.0/0 includes 127.0.0.0/8) and no loopback exemption is emitted.
-	value := joined(baseConfig(t).AddScript())
-	if !strings.Contains(value, "-p tcp -d 0.0.0.0/0 --dport 443 -j REDIRECT") {
-		t.Fatalf("port-scoped capture should cover every address:\n%s", value)
+func TestAddScript_Loopback(t *testing.T) {
+	// Loopback handling must not depend on whether ports are given: excluded
+	// by default, captured only when Loopback is set.
+	scopes := map[string]func(*Config){
+		"ports":     func(c *Config) {},
+		"all ports": func(c *Config) { c.Filter.Ports, c.Filter.AllPorts = nil, true },
 	}
-	if strings.Contains(value, "-d "+loopbackCIDR+" -j RETURN") {
-		t.Fatalf("port-scoped capture should not exempt loopback:\n%s", value)
+	exempt := []string{
+		"-A SB_TP_REDIR_execid123456 -d " + loopbackCIDR + " -j RETURN",
+		"-A SB_TP_FLUSH_execid123456 -d " + loopbackCIDR + " -j RETURN",
+	}
+	for name, scope := range scopes {
+		t.Run(name+", loopback excluded by default", func(t *testing.T) {
+			c := baseConfig(t)
+			scope(&c)
+			script := joined(c.AddScript())
+			for _, want := range exempt {
+				if !strings.Contains(script, want) {
+					t.Errorf("AddScript missing line:\n  %s\nfull script:\n%s", want, script)
+				}
+			}
+			if strings.Index(script, "-d "+loopbackCIDR+" -j RETURN") > strings.Index(script, "-j REDIRECT") {
+				t.Errorf("loopback exemption must come before the REDIRECT:\n%s", script)
+			}
+		})
+		t.Run(name+", loopback captured", func(t *testing.T) {
+			c := baseConfig(t)
+			scope(&c)
+			c.Filter.Loopback = true
+			script := joined(c.AddScript())
+			if strings.Contains(script, loopbackCIDR) {
+				t.Errorf("loopback must not be exempted when Loopback is set:\n%s", script)
+			}
+			if !strings.Contains(script, "-d 0.0.0.0/0") {
+				t.Errorf("capture should still cover every address:\n%s", script)
+			}
+		})
+		t.Run(name+", loopback captured except own ports", func(t *testing.T) {
+			c := baseConfig(t)
+			scope(&c)
+			c.Filter.Loopback = true
+			c.Filter.LoopbackExcludePorts = []uint16{8085, 8081}
+			script := joined(c.AddScript())
+			for _, chain := range []string{"SB_TP_REDIR_execid123456", "SB_TP_FLUSH_execid123456"} {
+				for _, p := range []string{"8085", "8081"} {
+					want := "-A " + chain + " -p tcp -d " + loopbackCIDR + " --dport " + p + " -j RETURN"
+					if !strings.Contains(script, want) {
+						t.Errorf("AddScript missing line:\n  %s\nfull script:\n%s", want, script)
+					}
+				}
+			}
+			if strings.Contains(script, "-d "+loopbackCIDR+" -j RETURN") {
+				t.Errorf("loopback as a whole must not be exempted when Loopback is set:\n%s", script)
+			}
+			if strings.Index(script, "--dport 8085 -j RETURN") > strings.Index(script, "-j REDIRECT") {
+				t.Errorf("own-port exemption must come before the REDIRECT:\n%s", script)
+			}
+		})
+	}
+}
+
+func TestAddScript_LoopbackExcludePortsIgnoredWithoutLoopback(t *testing.T) {
+	c := baseConfig(t)
+	c.Filter.LoopbackExcludePorts = []uint16{8085}
+	if script := joined(c.AddScript()); strings.Contains(script, "--dport 8085") {
+		t.Errorf("own-port exemption is redundant while loopback is excluded:\n%s", script)
 	}
 }
 

@@ -63,8 +63,9 @@ func intercept(t *testing.T, proxyPort, upstreamPort uint16, execID string) {
 		ExecutionID: execID,
 		ProxyPort:   proxyPort,
 		Filter: interception.Filter{
-			Include: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
-			Ports:   []uint16{upstreamPort},
+			Include:  []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
+			Loopback: true,
+			Ports:    []uint16{upstreamPort},
 		},
 	}
 	if err := cfg.Apply(context.Background(), interception.ExecRunner{}); err != nil {

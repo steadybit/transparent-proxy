@@ -56,10 +56,12 @@ func main() {
 
 		prePorts = flag.String("preflight-ports", "", "comma-separated target ports to refuse-on-conflict against an existing mesh (defaults to --intercept-ports; with every port intercepted, any existing redirect conflicts)")
 
-		interceptCIDRs = flag.String("intercept-cidrs", "", "comma-separated destination CIDRs to capture; enables self-managed interception")
-		interceptPorts = flag.String("intercept-ports", "", "comma-separated destination ports to capture; empty with --intercept-cidrs captures every port (loopback excepted)")
-		excludeCIDRs   = flag.String("exclude-cidrs", "", "comma-separated destinations never to touch (agent/platform)")
-		execID         = flag.String("exec-id", "default", "execution id used to name the interception chains")
+		interceptCIDRs    = flag.String("intercept-cidrs", "", "comma-separated destination CIDRs to capture; enables self-managed interception")
+		interceptPorts    = flag.String("intercept-ports", "", "comma-separated destination ports to capture; empty with --intercept-cidrs captures every port")
+		interceptLoopback = flag.Bool("intercept-loopback", false, "also capture traffic to loopback (127.0.0.0/8), e.g. to sidecars or local databases; by default loopback is never captured, with or without --intercept-ports")
+		loopbackExclude   = flag.String("exclude-loopback-ports", "", "comma-separated loopback destination ports never to capture even with --intercept-loopback (e.g. the orchestrator's own ports)")
+		excludeCIDRs      = flag.String("exclude-cidrs", "", "comma-separated destinations never to touch (agent/platform)")
+		execID            = flag.String("exec-id", "default", "execution id used to name the interception chains")
 
 		revert = flag.Bool("revert", false, "remove the interception rules for the given --exec-id/--intercept-* and exit (out-of-band teardown, idempotent)")
 
@@ -122,7 +124,7 @@ func main() {
 	// Validate the interception filter and whether self-managed mode is wanted.
 	// The port is filled in after we bind (below); 0 is fine here because this
 	// instance is only used for --revert, where the port is irrelevant.
-	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), 0, *noFlush, nil)
+	interceptor, wantIntercept, err := buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *interceptLoopback, *loopbackExclude, *execID, uint32(*mark), 0, *noFlush, nil)
 	if err != nil {
 		logger.Error("invalid interception configuration", slog.Any("err", err))
 		os.Exit(2)
@@ -197,7 +199,7 @@ func main() {
 		}
 		port := uint16(ln.Addr().(*net.TCPAddr).Port)
 		flushDsts, flushScoped := flushDestinations(rules, logger)
-		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *execID, uint32(*mark), port, skipFlush(*noFlush, flushScoped, flushDsts), flushDsts)
+		interceptor, _, err = buildInterceptor(*interceptCIDRs, *interceptPorts, *excludeCIDRs, *interceptLoopback, *loopbackExclude, *execID, uint32(*mark), port, skipFlush(*noFlush, flushScoped, flushDsts), flushDsts)
 		if err != nil {
 			logger.Error("invalid interception configuration", slog.Any("err", err))
 			os.Exit(2)
@@ -205,7 +207,8 @@ func main() {
 		guard := &supervisor.Guard{Interceptor: interceptor, Logger: logger, MaxDuration: *maxDuration}
 		logger.Info("starting with self-managed interception (fail-open)",
 			slog.String("exec_id", *execID), slog.Int("proxy_port", int(port)),
-			slog.Bool("all_ports", allPorts), slog.Duration("server_first_timeout", srv.ServerFirstTimeout))
+			slog.Bool("all_ports", allPorts), slog.Bool("loopback", *interceptLoopback),
+			slog.Duration("server_first_timeout", srv.ServerFirstTimeout))
 		err = guard.Run(ctx, func(ctx context.Context) error { return srv.Serve(ctx, ln) })
 	} else {
 		runCtx := ctx
@@ -423,7 +426,7 @@ func (a interceptorAdapter) Revert(ctx context.Context) error { return a.cfg.Rev
 // targets the exact port the proxy bound — there is no pre-allocated port that
 // another process could steal between allocation and bind. For --revert the
 // port is irrelevant (chain names derive from the exec-id) and may be 0.
-func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyPort uint16, noFlush bool, flushDsts []netip.Prefix) (supervisor.Interceptor, bool, error) {
+func buildInterceptor(cidrs, ports, excludes string, loopback bool, loopbackExcludes, execID string, mark uint32, proxyPort uint16, noFlush bool, flushDsts []netip.Prefix) (supervisor.Interceptor, bool, error) {
 	if cidrs == "" && ports == "" {
 		return nil, false, nil
 	}
@@ -439,6 +442,12 @@ func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyP
 	exclude, err := parseCIDRs(excludes)
 	if err != nil {
 		return nil, false, fmt.Errorf("exclude-cidrs: %w", err)
+	}
+	var loopbackExcludePorts []uint16
+	if loopbackExcludes != "" {
+		if loopbackExcludePorts, err = parsePorts(loopbackExcludes); err != nil {
+			return nil, false, fmt.Errorf("exclude-loopback-ports: %w", err)
+		}
 	}
 	allPorts := interceptsAllPorts(ports)
 	var tcpPorts []uint16
@@ -459,6 +468,9 @@ func buildInterceptor(cidrs, ports, excludes, execID string, mark uint32, proxyP
 			Exclude:  exclude,
 			Ports:    tcpPorts,
 			AllPorts: allPorts,
+			Loopback: loopback,
+
+			LoopbackExcludePorts: loopbackExcludePorts,
 		},
 	}
 	return interceptorAdapter{cfg: cfg, runner: interception.ExecRunner{}}, true, nil

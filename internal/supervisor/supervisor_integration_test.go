@@ -41,8 +41,9 @@ func newGuard(execID string) (*Guard, string) {
 		ExecutionID: execID,
 		ProxyPort:   3199,
 		Filter: interception.Filter{
-			Include: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
-			Ports:   []uint16{9999},
+			Include:  []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
+			Loopback: true,
+			Ports:    []uint16{9999},
 		},
 	}
 	return &Guard{Interceptor: adapter{cfg: cfg, runner: interception.ExecRunner{}}}, "SB_TP_REDIR_" + execID
