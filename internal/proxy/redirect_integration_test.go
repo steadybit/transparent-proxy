@@ -59,8 +59,9 @@ func TestRedirect_FullCaptureWithLoopProtection(t *testing.T) {
 		ExecutionID: "e2e-redirect",
 		ProxyPort:   pxPort,
 		Filter: interception.Filter{
-			Include: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
-			Ports:   []uint16{upPort},
+			Include:  []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
+			Loopback: true,
+			Ports:    []uint16{upPort},
 		},
 	}
 	if err := cfg.Apply(ctx, interception.ExecRunner{}); err != nil {

@@ -17,6 +17,8 @@ const loopbackCIDR = "127.0.0.0/8"
 func TestBuildInterceptor_PortScopes(t *testing.T) {
 	cases := []struct {
 		name, cidrs, ports string
+		loopback           bool
+		loopbackExcludes   string
 		wantIntercept      bool
 		wantErr            bool
 		wantInScript       string
@@ -28,10 +30,15 @@ func TestBuildInterceptor_PortScopes(t *testing.T) {
 		{name: "empty ports: every port", cidrs: "0.0.0.0/0", ports: "", wantIntercept: true, wantInScript: "-d " + loopbackCIDR + " -j RETURN", notInScript: "--dport"},
 		{name: "only separators: rejected", cidrs: "0.0.0.0/0", ports: " , ", wantErr: true},
 		{name: "invalid port", cidrs: "0.0.0.0/0", ports: "80,http", wantErr: true},
+		{name: "explicit ports: loopback excluded", cidrs: "0.0.0.0/0", ports: "80", wantIntercept: true, wantInScript: "-d " + loopbackCIDR + " -j RETURN"},
+		{name: "explicit ports: loopback captured", cidrs: "0.0.0.0/0", ports: "80", loopback: true, wantIntercept: true, notInScript: loopbackCIDR},
+		{name: "every port: loopback captured", cidrs: "0.0.0.0/0", loopback: true, wantIntercept: true, notInScript: loopbackCIDR},
+		{name: "loopback captured except own ports", cidrs: "0.0.0.0/0", loopback: true, loopbackExcludes: "8085,8081", wantIntercept: true, wantInScript: "-p tcp -d " + loopbackCIDR + " --dport 8081 -j RETURN"},
+		{name: "invalid loopback exclude port", cidrs: "0.0.0.0/0", loopback: true, loopbackExcludes: "ext", wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ic, want, err := buildInterceptor(tc.cidrs, tc.ports, "", "exec", 0, 3128, false, nil)
+			ic, want, err := buildInterceptor(tc.cidrs, tc.ports, "", tc.loopback, tc.loopbackExcludes, "exec", 0, 3128, false, nil)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
 			}

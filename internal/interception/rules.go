@@ -39,16 +39,21 @@ type Filter struct {
 	// AllPorts captures every destination port instead of Ports, so the proxy
 	// can find HTTP/TLS wherever it runs. The proxy still decides per connection
 	// (by Host/SNI) what to fault; everything else is spliced through untouched.
-	// Loopback is never captured in this mode: with no port to narrow it, a
-	// 0.0.0.0/0 include would otherwise pull in every app-to-sidecar and local
-	// database connection.
 	AllPorts bool
+	// Loopback also captures traffic to loopback destinations. By default
+	// (false) loopback is excluded, with or without Ports, so app-to-sidecar
+	// and local database connections are untouched unless asked for.
+	Loopback bool
+	// LoopbackExcludePorts are loopback destination ports never captured even
+	// with Loopback set, e.g. the orchestrating extension's own ports when the
+	// target shares the host network. Ignored without Loopback.
+	LoopbackExcludePorts []uint16
 }
 
 // loopbackV4 is the whole IPv4 loopback range: 127.0.0.1 (localhost) and every
 // other 127.x.x.x address, which the kernel delivers inside the network
-// namespace without ever leaving it. It is excluded from capture whenever
-// AllPorts is set, so app-to-sidecar and local database traffic is untouched.
+// namespace without ever leaving it. It is excluded from capture unless
+// Filter.Loopback is set.
 const loopbackV4 = "127.0.0.0/8"
 
 // Config is a single interception rule set, scoped by ExecutionID.
@@ -115,6 +120,10 @@ func (c Config) Validate() error {
 	if len(includeV4(c.Filter.Include)) == 0 {
 		return errors.New("at least one IPv4 include CIDR is required")
 	}
+	if !c.Filter.Loopback && onlyLoopback(c.Filter.Include) {
+		// Loopback is excluded by default, so this would capture nothing.
+		return errors.New("include CIDRs only cover loopback, which is not captured unless loopback interception is enabled")
+	}
 	if c.Filter.AllPorts && len(c.Filter.Ports) > 0 {
 		return errors.New("target ports and all-ports are mutually exclusive")
 	}
@@ -132,10 +141,7 @@ func (c Config) AddScript() []string {
 	redir := c.redirectChain()
 	flush := c.flushChain()
 	includes := includeV4(c.Filter.Include)
-	excludes := includeV4(c.Filter.Exclude)
-	if c.Filter.AllPorts {
-		excludes = append(excludes, loopbackV4)
-	}
+	excludes := c.excludeMatches()
 	portMatches := c.portMatches()
 
 	var s []string
@@ -144,7 +150,7 @@ func (c Config) AddScript() []string {
 	s = append(s, "*nat", fmt.Sprintf(":%s - [0:0]", redir))
 	s = append(s, fmt.Sprintf("-A %s -m mark --mark %s -j RETURN", redir, mark))
 	for _, ex := range excludes {
-		s = append(s, fmt.Sprintf("-A %s -d %s -j RETURN", redir, ex))
+		s = append(s, fmt.Sprintf("-A %s %s -j RETURN", redir, ex))
 	}
 	for _, in := range includes {
 		for _, pm := range portMatches {
@@ -162,7 +168,7 @@ func (c Config) AddScript() []string {
 		s = append(s, "*filter", fmt.Sprintf(":%s - [0:0]", flush))
 		s = append(s, fmt.Sprintf("-A %s -m mark --mark %s -j RETURN", flush, mark))
 		for _, ex := range excludes {
-			s = append(s, fmt.Sprintf("-A %s -d %s -j RETURN", flush, ex))
+			s = append(s, fmt.Sprintf("-A %s %s -j RETURN", flush, ex))
 		}
 		flushDsts := includes
 		if len(c.FlushDestinations) > 0 {
@@ -181,6 +187,23 @@ func (c Config) AddScript() []string {
 	}
 
 	return s
+}
+
+// excludeMatches returns the match fragment of each RETURN rule that keeps a
+// destination out of both the capture and the flush: the Exclude nets, plus
+// loopback as a whole, or only LoopbackExcludePorts on it when Loopback is set.
+func (c Config) excludeMatches() []string {
+	var out []string
+	for _, ex := range includeV4(c.Filter.Exclude) {
+		out = append(out, "-d "+ex)
+	}
+	if !c.Filter.Loopback {
+		return append(out, "-d "+loopbackV4)
+	}
+	for _, p := range c.Filter.LoopbackExcludePorts {
+		out = append(out, fmt.Sprintf("-p tcp -d %s --dport %d", loopbackV4, p))
+	}
+	return out
 }
 
 // portMatches returns the --dport fragment for each rule to emit: one per target
@@ -308,6 +331,18 @@ func (c Config) verifyClean(ctx context.Context, r CommandRunner) error {
 		}
 	}
 	return nil
+}
+
+// onlyLoopback reports whether every IPv4 include lies inside 127.0.0.0/8.
+func onlyLoopback(prefixes []netip.Prefix) bool {
+	loopback := netip.MustParsePrefix(loopbackV4)
+	for _, in := range includeV4(prefixes) {
+		p := netip.MustParsePrefix(in)
+		if p.Bits() < loopback.Bits() || !loopback.Contains(p.Addr()) {
+			return false
+		}
+	}
+	return true
 }
 
 // includeV4 returns the string form of every IPv4 (or v4-mapped) prefix; IPv6

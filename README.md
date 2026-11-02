@@ -68,6 +68,25 @@ The hostname/SNI targeting is what makes **one** tool work for both internal
   [HTTPS response injection](#https-response-injection). Without a CA the proxy
   never decrypts anything.
 
+## Interception scope
+
+With `--intercept-cidrs`, the proxy installs its own iptables capture. iptables
+only sees addresses and ports, so the capture is broad and the proxy picks the
+connections to fault by hostname once they arrive; everything else is relayed
+untouched.
+
+- `--intercept-cidrs` — destinations to capture (typically `0.0.0.0/0`).
+- `--intercept-ports` — destination ports to capture; empty captures every port.
+- `--exclude-cidrs` — destinations never touched (agent/platform).
+- `--intercept-loopback` — also capture traffic to loopback (`127.0.0.0/8`).
+  **Off by default, with or without ports**: connections to sidecars, local
+  databases or a local forward proxy stay out of the proxy. When on, they are
+  relayed through it; existing loopback connections can be reset when the
+  attack starts (connection-pool flush) and are closed when it ends.
+- `--exclude-loopback-ports` — loopback ports never captured even with
+  `--intercept-loopback`, e.g. the orchestrating extension's own ports when
+  the target shares the host network.
+
 ## Fault rules
 
 Rules are JSON; the first matching rule wins. A rule matches when **both** its
