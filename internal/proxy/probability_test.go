@@ -26,7 +26,7 @@ func TestServer_ProbabilityAppliesPerRequestOnKeepAlive(t *testing.T) {
 	const (
 		host        = "dependency.test"
 		requests    = 1000
-		probability = 0.99
+		probability = 0.50
 		// ±10 points is about 6 standard deviations at n=1000, so the test is
 		// not flaky while still catching a per-connection roll (≈0%).
 		tolerance = 0.10
