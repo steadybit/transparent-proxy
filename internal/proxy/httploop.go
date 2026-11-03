@@ -14,6 +14,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/steadybit/transparent-proxy/internal/fault"
 )
 
 // serveHTTP handles a matched cleartext HTTP/1.x connection request by
@@ -85,10 +87,11 @@ type httpConn struct {
 // serve answers one request and reports whether the connection can carry the
 // next one.
 func (c *httpConn) serve(ctx context.Context, req *http.Request) bool {
-	action := c.s.Faults.Match(c.dst, hostWithoutPort(req.Host))
+	host := hostWithoutPort(req.Host)
+	action := c.s.Faults.Match(c.dst, host)
+	c.countRequest(host, action)
 
 	if action.Abort {
-		c.markFaulted()
 		c.s.Metrics.Aborted()
 		c.log.Debug("aborting connection (reset)")
 		reset(c.client)
@@ -96,7 +99,6 @@ func (c *httpConn) serve(ctx context.Context, req *http.Request) bool {
 	}
 
 	if action.Latency > 0 {
-		c.markFaulted()
 		c.s.Metrics.LatencyInjected()
 		select {
 		case <-time.After(action.Latency):
@@ -107,7 +109,6 @@ func (c *httpConn) serve(ctx context.Context, req *http.Request) bool {
 	}
 
 	if action.HTTPStatus != 0 {
-		c.markFaulted()
 		// The body must be consumed so the next request starts at its head.
 		_, _ = io.Copy(io.Discard, req.Body)
 		if err := writeHTTPResponse(c.client, req, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody); err != nil {
@@ -240,14 +241,23 @@ func (c *httpConn) upstreamReusable() bool {
 	return c.upstreamR.Buffered() == 0 && idleConnAlive(c.upstream)
 }
 
-// markFaulted records the connection as faulted, once.
-func (c *httpConn) markFaulted() {
-	if c.faulted {
+// countRequest records a request that matched a rule and, if its fault applies,
+// that it was faulted. The connection itself counts as faulted once, on its
+// first faulted request.
+func (c *httpConn) countRequest(host string, action fault.Action) {
+	if action.Rule == "" {
 		return
 	}
-	c.faulted = true
-	c.s.Metrics.Faulted()
-	c.s.Metrics.FaultedHost(c.identity)
+	c.s.Metrics.MatchedRequest(host)
+	if !action.Faulted() {
+		return
+	}
+	c.s.Metrics.FaultedRequest(host)
+	if !c.faulted {
+		c.faulted = true
+		c.s.Metrics.Faulted()
+		c.s.Metrics.FaultedHost(c.identity)
+	}
 }
 
 type countingWriter struct {

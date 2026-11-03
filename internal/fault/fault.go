@@ -73,6 +73,11 @@ type Action struct {
 	HTTPHeaders map[string]string
 }
 
+// Faulted reports whether the action applies any fault.
+func (a Action) Faulted() bool {
+	return a.Abort || a.Latency > 0 || a.HTTPStatus != 0
+}
+
 // Engine holds an ordered rule set. The first matching rule wins.
 type Engine struct {
 	rules []Rule

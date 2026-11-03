@@ -88,6 +88,28 @@ func TestMetrics_PerHostAndFaultCounters(t *testing.T) {
 	}
 }
 
+func TestMetrics_RequestCounters(t *testing.T) {
+	m := New()
+
+	// one keep-alive connection to api.example.com carrying three requests, two
+	// of them faulted.
+	m.MatchedHost("api.example.com")
+	for range 3 {
+		m.MatchedRequest("api.example.com")
+	}
+	m.FaultedRequest("api.example.com")
+	m.FaultedRequest("api.example.com")
+
+	s := m.Snapshot()
+	if s.RequestsMatched != 3 || s.RequestsFaulted != 2 {
+		t.Fatalf("requests matched/faulted = %d/%d, want 3/2", s.RequestsMatched, s.RequestsFaulted)
+	}
+	got := s.PerHost["api.example.com"]
+	if got != (HostStat{Matched: 1, RequestsMatched: 3, RequestsFaulted: 2}) {
+		t.Fatalf("per-host = %+v", got)
+	}
+}
+
 func TestMetrics_NilSafe(t *testing.T) {
 	var m *Metrics // nil
 	// None of these must panic.
@@ -97,6 +119,8 @@ func TestMetrics_NilSafe(t *testing.T) {
 	m.Proxied()
 	m.UpstreamError()
 	m.AddBytes(1, 2)
+	m.MatchedRequest("x")
+	m.FaultedRequest("x")
 	if s := m.Snapshot(); !reflect.DeepEqual(s, Snapshot{}) {
 		t.Fatalf("nil metrics should snapshot to zero, got %+v", s)
 	}

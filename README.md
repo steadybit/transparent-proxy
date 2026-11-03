@@ -125,6 +125,10 @@ by the proxy and the connection stays open; the others are forwarded over one
 upstream connection the proxy keeps open (and reopens if the server closed it
 while idle). An `abort` closes the connection, so the client reconnects for its
 next request.
+The metrics count these requests as `requests_matched` and
+`requests_faulted` (also per host), so the observed share of faulted requests
+can be checked against `probability`; the `connections_*` counters stay per
+connection.
 
 **Everything else — per connection.** TLS without an interception CA, HTTPS
 through the interception CA, and non-HTTP TCP are rolled once when the

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/steadybit/transparent-proxy/internal/fault"
+	"github.com/steadybit/transparent-proxy/internal/metrics"
 )
 
 // TestServeHTTP_HeadKeepsConnectionUsable sends a HEAD and then a GET on one
@@ -46,6 +47,35 @@ func TestServeHTTP_HeadKeepsConnectionUsable(t *testing.T) {
 				t.Fatalf("GET status = %d, want %d", get.StatusCode, tc.wantStatus)
 			}
 		})
+	}
+}
+
+// TestServeHTTP_CountsRequests checks that the per-request counters match what
+// the client saw, so the statistics can show the share of faulted requests even
+// though every request went over one connection.
+func TestServeHTTP_CountsRequests(t *testing.T) {
+	const (
+		host     = "dependency.test"
+		requests = 200
+	)
+
+	m := metrics.New()
+	upstream := startCountingUpstream(t)
+	proxyAddr := serveProxy(t, &Server{
+		Faults:  fault.NewEngine([]fault.Rule{statusRule(host, 0.5, http.StatusServiceUnavailable)}),
+		Metrics: m,
+	}, upstream.addr)
+	client := newKeepAliveClient(t, proxyAddr)
+
+	got := client.sendGets(t, "http://"+host+"/", requests)
+	faulted := int64(got[http.StatusServiceUnavailable])
+
+	s := m.Snapshot()
+	if s.RequestsMatched != requests || s.RequestsFaulted != faulted {
+		t.Fatalf("requests matched/faulted = %d/%d, want %d/%d", s.RequestsMatched, s.RequestsFaulted, requests, faulted)
+	}
+	if h := s.PerHost[host]; h.RequestsMatched != requests || h.RequestsFaulted != faulted {
+		t.Fatalf("per-host requests matched/faulted = %d/%d, want %d/%d", h.RequestsMatched, h.RequestsFaulted, requests, faulted)
 	}
 }
 

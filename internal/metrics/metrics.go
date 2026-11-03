@@ -24,8 +24,10 @@ type Metrics struct {
 	ConnectionsAborted    atomic.Int64 // reset by an abort rule
 	ConnectionsDropped    atomic.Int64 // loop guard / peek failure / self-refusal
 	ConnectionsFaulted    atomic.Int64 // connections a fault was actually applied to (once each)
-	LatencyApplied        atomic.Int64 // connections a latency fault delayed
-	HTTPResponsesInjected atomic.Int64 // connections given a synthesized HTTP response
+	LatencyApplied        atomic.Int64 // connections (or cleartext HTTP requests) a latency fault delayed
+	HTTPResponsesInjected atomic.Int64 // synthesized HTTP responses written
+	RequestsMatched       atomic.Int64 // cleartext HTTP requests that matched a rule
+	RequestsFaulted       atomic.Int64 // cleartext HTTP requests a fault was applied to
 	TLSInterceptRejected  atomic.Int64 // HTTPS interception rejected by the client (CA not trusted / pinning)
 	UpstreamErrors        atomic.Int64 // dial failures
 	BytesToUpstream       atomic.Int64
@@ -41,8 +43,10 @@ type Metrics struct {
 }
 
 type hostCounters struct {
-	matched int64
-	faulted int64
+	matched         int64
+	faulted         int64
+	requestsMatched int64
+	requestsFaulted int64
 }
 
 // New returns a ready-to-use Metrics.
@@ -50,8 +54,10 @@ func New() *Metrics { return &Metrics{perHost: map[string]*hostCounters{}} }
 
 // HostStat is the per-hostname view in a Snapshot.
 type HostStat struct {
-	Matched int64 `json:"matched"`
-	Faulted int64 `json:"faulted"`
+	Matched         int64 `json:"matched"`
+	Faulted         int64 `json:"faulted"`
+	RequestsMatched int64 `json:"requests_matched"`
+	RequestsFaulted int64 `json:"requests_faulted"`
 }
 
 // Snapshot is a point-in-time, JSON-serialisable view.
@@ -64,6 +70,8 @@ type Snapshot struct {
 	ConnectionsFaulted    int64               `json:"connections_faulted"`
 	LatencyApplied        int64               `json:"latency_applied"`
 	HTTPResponsesInjected int64               `json:"http_responses_injected"`
+	RequestsMatched       int64               `json:"requests_matched"`
+	RequestsFaulted       int64               `json:"requests_faulted"`
 	TLSInterceptRejected  int64               `json:"tls_intercept_rejected"`
 	UpstreamErrors        int64               `json:"upstream_errors"`
 	BytesToUpstream       int64               `json:"bytes_to_upstream"`
@@ -82,7 +90,12 @@ func (m *Metrics) Snapshot() Snapshot {
 	if len(m.perHost) > 0 {
 		perHost = make(map[string]HostStat, len(m.perHost))
 		for h, c := range m.perHost {
-			perHost[h] = HostStat{Matched: c.matched, Faulted: c.faulted}
+			perHost[h] = HostStat{
+				Matched:         c.matched,
+				Faulted:         c.faulted,
+				RequestsMatched: c.requestsMatched,
+				RequestsFaulted: c.requestsFaulted,
+			}
 		}
 	}
 	m.mu.Unlock()
@@ -95,6 +108,8 @@ func (m *Metrics) Snapshot() Snapshot {
 		ConnectionsFaulted:    m.ConnectionsFaulted.Load(),
 		LatencyApplied:        m.LatencyApplied.Load(),
 		HTTPResponsesInjected: m.HTTPResponsesInjected.Load(),
+		RequestsMatched:       m.RequestsMatched.Load(),
+		RequestsFaulted:       m.RequestsFaulted.Load(),
 		TLSInterceptRejected:  m.TLSInterceptRejected.Load(),
 		UpstreamErrors:        m.UpstreamErrors.Load(),
 		BytesToUpstream:       m.BytesToUpstream.Load(),
@@ -165,15 +180,16 @@ func (m *Metrics) Faulted() {
 	}
 }
 
-// LatencyInjected records a connection a latency fault delayed.
+// LatencyInjected records a connection, or a cleartext HTTP request, a latency
+// fault delayed.
 func (m *Metrics) LatencyInjected() {
 	if m != nil {
 		m.LatencyApplied.Add(1)
 	}
 }
 
-// HTTPInjected records a connection given a synthesized HTTP response (instead
-// of being forwarded upstream).
+// HTTPInjected records a synthesized HTTP response written instead of
+// forwarding the request upstream.
 func (m *Metrics) HTTPInjected() {
 	if m != nil {
 		m.HTTPResponsesInjected.Add(1)
@@ -196,10 +212,35 @@ func (m *Metrics) TLSRejected() {
 // MatchedHost records that a connection carrying the given dependency hostname
 // matched a rule. FaultedHost records that a fault was actually applied to it
 // (i.e. it passed the probability roll). Empty hosts are ignored.
-func (m *Metrics) MatchedHost(host string) { m.addHost(host, true, false) }
-func (m *Metrics) FaultedHost(host string) { m.addHost(host, false, true) }
+func (m *Metrics) MatchedHost(host string) {
+	m.addHost(host, func(c *hostCounters) { c.matched++ })
+}
 
-func (m *Metrics) addHost(host string, matched, faulted bool) {
+func (m *Metrics) FaultedHost(host string) {
+	m.addHost(host, func(c *hostCounters) { c.faulted++ })
+}
+
+// MatchedRequest and FaultedRequest are the per-request counterparts for
+// cleartext HTTP, where the probability is rolled per request: a keep-alive
+// connection carries many requests, so only these show the share of requests
+// that was faulted.
+func (m *Metrics) MatchedRequest(host string) {
+	if m == nil {
+		return
+	}
+	m.RequestsMatched.Add(1)
+	m.addHost(host, func(c *hostCounters) { c.requestsMatched++ })
+}
+
+func (m *Metrics) FaultedRequest(host string) {
+	if m == nil {
+		return
+	}
+	m.RequestsFaulted.Add(1)
+	m.addHost(host, func(c *hostCounters) { c.requestsFaulted++ })
+}
+
+func (m *Metrics) addHost(host string, count func(*hostCounters)) {
 	if m == nil || host == "" {
 		return
 	}
@@ -210,12 +251,7 @@ func (m *Metrics) addHost(host string, matched, faulted bool) {
 		c = &hostCounters{}
 		m.perHost[host] = c
 	}
-	if matched {
-		c.matched++
-	}
-	if faulted {
-		c.faulted++
-	}
+	count(c)
 }
 
 func (m *Metrics) UpstreamError() {
