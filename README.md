@@ -62,6 +62,10 @@ The hostname/SNI targeting is what makes **one** tool work for both internal
 - **Inspected path:** when a rule targets by hostname, the proxy reads only the
   first TLS record to extract the SNI (cleartext — **no MITM, no certificates**),
   replays those bytes to the upstream, then splices the remainder.
+- **Cleartext HTTP path:** when a rule matches the `Host` header of a cleartext
+  HTTP/1.x connection, the proxy handles it request by request instead of
+  splicing it, so faults apply per request on keep-alive connections (see
+  [How probability applies](#how-probability-applies)).
 - **Interception path (opt-in):** only when a CA is supplied via
   `--tls-ca-cert`/`--tls-ca-key` *and* a matching rule carries `httpStatus`, an
   HTTPS connection is terminated so the response can be synthesized. See
@@ -104,11 +108,44 @@ selectors match — an empty selector means "any".
 
 - `cidrs` — match the original destination IP (internal targeting).
 - `hosts` — match the TLS SNI, exact or subdomain (external targeting).
-- `latency` — Go duration string, added before the upstream connect.
+- `latency` — Go duration string, added before the upstream connect (for
+  cleartext HTTP: before each affected request is forwarded).
 - `abort` — reset (RST) the connection.
 - `httpStatus` — synthesize this HTTP status (L7). Cleartext HTTP always; HTTPS
   only with an interception CA (see below).
-- `probability` — `[0,1]` chance to apply the fault per connection (`0`/unset = always).
+- `probability` — `[0,1]` chance to apply the fault (unset = always, `0` =
+  never), per request for cleartext HTTP and per connection otherwise.
+
+### How probability applies
+
+**Cleartext HTTP/1.x — per request.** Each request on a matched connection is
+rolled on its own, so with `0.5` about half of a keep-alive client's requests
+are faulted, however few connections it opens. A faulted request is answered
+by the proxy and the connection stays open; the others are forwarded over one
+upstream connection the proxy keeps open (and reopens if the server closed it
+while idle). An `abort` closes the connection, so the client reconnects for its
+next request.
+The metrics count these requests as `requests_matched` and
+`requests_faulted` (also per host), so the observed share of faulted requests
+can be checked against `probability`; the `connections_*` counters stay per
+connection.
+
+**Everything else — per connection.** TLS without an interception CA, HTTPS
+through the interception CA, and non-HTTP TCP are rolled once when the
+connection opens, and every request on it shares that outcome. A keep-alive
+client that wins the roll keeps the connection, so the observed failure rate
+of its requests can be far below `probability`.
+
+Limits of the per-request path:
+
+- An upgraded connection (e.g. WebSocket) is rolled on its upgrade request
+  only; after the `101` its traffic is passed through untouched.
+- Whether a connection takes this path is decided by its first request. If
+  that request matches no rule, the connection is spliced and later requests
+  on it are not inspected.
+- A request with `Expect: 100-continue` waits for the client's own timeout
+  (typically ~1s) before its body is sent, since the proxy does not answer the
+  `100` itself.
 
 ## HTTPS response injection
 
