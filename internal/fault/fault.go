@@ -28,10 +28,10 @@ type Rule struct {
 	CIDRs []netip.Prefix
 	Hosts []string
 
-	// Probability in [0,1] gates whether this rule's fault is applied to a given
-	// matching connection (the "affect X% of connections" knob). A nil pointer
-	// means unset → always (1.0); an explicit 0 means never; values are used as
-	// given otherwise.
+	// Probability in [0,1] gates whether this rule's fault is applied to a
+	// matching request (cleartext HTTP) or connection (everything else). A nil
+	// pointer means unset → always (1.0); an explicit 0 means never; values are
+	// used as given otherwise.
 	Probability *float64
 
 	// Latency is added before the upstream connection is established,
