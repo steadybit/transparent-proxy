@@ -27,6 +27,7 @@ import (
 // forwarded request.
 func (s *Server) serveHTTP(ctx context.Context, log *slog.Logger, client *net.TCPConn, dst netip.AddrPort, identity string, prefix []byte, early *net.TCPConn) {
 	c := &httpConn{s: s, log: log, client: client, dst: dst, identity: identity}
+	c.clientR = bufio.NewReader(io.MultiReader(bytes.NewReader(prefix), client))
 	c.setUpstream(early)
 	defer c.closeUpstream()
 
@@ -42,9 +43,8 @@ func (s *Server) serveHTTP(ctx context.Context, log *slog.Logger, client *net.TC
 		}
 	}()
 
-	br := bufio.NewReader(io.MultiReader(bytes.NewReader(prefix), client))
 	for {
-		req, err := http.ReadRequest(br)
+		req, err := http.ReadRequest(c.clientR)
 		if err != nil {
 			// EOF between requests is the client closing a keep-alive connection.
 			if err != io.EOF {
@@ -68,6 +68,7 @@ type httpConn struct {
 	s        *Server
 	log      *slog.Logger
 	client   *net.TCPConn
+	clientR  *bufio.Reader
 	dst      netip.AddrPort
 	identity string
 
@@ -159,6 +160,11 @@ func (c *httpConn) forward(ctx context.Context, req *http.Request) bool {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		c.tunnel(resp)
+		return false
+	}
+
 	down := &countingWriter{w: c.client}
 	err = resp.Write(down)
 	c.bytesDown += down.n
@@ -168,6 +174,44 @@ func (c *httpConn) forward(ctx context.Context, req *http.Request) bool {
 	}
 	// The upstream is closing, and resp.Write told the client so too.
 	return !resp.Close
+}
+
+// tunnel completes a protocol upgrade such as WebSocket: it passes the
+// server's 101 to the client and then copies raw bytes both ways until either
+// side closes, because the connection no longer carries HTTP.
+func (c *httpConn) tunnel(resp *http.Response) {
+	down := &countingWriter{w: c.client}
+	up := &countingWriter{w: c.upstream}
+	defer func() {
+		c.bytesUp += up.n
+		c.bytesDown += down.n
+	}()
+
+	if err := resp.Write(down); err != nil {
+		c.log.Debug("failed to forward upgrade response", slog.Any("err", err))
+		return
+	}
+	// Either side may already have sent bytes of the new protocol, which our
+	// readers buffered while parsing HTTP. They must go out before the splice.
+	if err := writeBuffered(down, c.upstreamR); err != nil {
+		return
+	}
+	if err := writeBuffered(up, c.clientR); err != nil {
+		return
+	}
+
+	c.log.Debug("upgraded; passing bytes through")
+	toUpstream, toClient := relay(c.client, c.upstream)
+	up.n += toUpstream
+	down.n += toClient
+}
+
+// writeBuffered writes out whatever r has already buffered, without reading
+// any more from its source.
+func writeBuffered(w io.Writer, r *bufio.Reader) error {
+	b, _ := r.Peek(r.Buffered())
+	_, err := w.Write(b)
+	return err
 }
 
 func (c *httpConn) setUpstream(up *net.TCPConn) {

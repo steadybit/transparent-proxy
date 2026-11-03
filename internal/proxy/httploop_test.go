@@ -101,6 +101,65 @@ func startClosingUpstream(t *testing.T) netip.AddrPort {
 	return ln.Addr().(*net.TCPAddr).AddrPort()
 }
 
+// TestServeHTTP_UpgradeSwitchesToRawBytes opens a WebSocket-style upgrade
+// through the proxy. After the server's 101 the connection no longer carries
+// HTTP, so the proxy must pass bytes through in both directions — including
+// ones the server sends right after the 101.
+func TestServeHTTP_UpgradeSwitchesToRawBytes(t *testing.T) {
+	const host = "dependency.test"
+
+	upstream := startUpgradeUpstream(t, "hello")
+	proxyAddr := startProxy(t, upstream, fault.NewEngine([]fault.Rule{
+		statusRule(host, 0, http.StatusServiceUnavailable),
+	}))
+	conn := dialRaw(t, proxyAddr)
+
+	req := newRequest(t, http.MethodGet, host)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	resp := conn.do(t, req)
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d, want 101", resp.StatusCode)
+	}
+
+	conn.readExactly(t, "hello")
+	if _, err := io.WriteString(conn, "ping"); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+	conn.readExactly(t, "ping")
+}
+
+// startUpgradeUpstream starts a server that accepts one upgrade per
+// connection: it answers 101, immediately sends greeting, and then echoes
+// whatever raw bytes it receives.
+func startUpgradeUpstream(t *testing.T, greeting string) netip.AddrPort {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen upstream: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = c.Close() }()
+				r := bufio.NewReader(c)
+				if _, err := http.ReadRequest(r); err != nil {
+					return
+				}
+				_, _ = io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\n"+
+					"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"+greeting)
+				_, _ = io.Copy(c, r)
+			}()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).AddrPort()
+}
+
 // rawConn is one client connection to the proxy, used for sending requests in
 // sequence and reading their responses, so a test controls exactly what goes
 // over a single keep-alive connection.
@@ -119,22 +178,47 @@ func dialRaw(t *testing.T, addr netip.AddrPort) *rawConn {
 	return &rawConn{Conn: c, r: bufio.NewReader(c)}
 }
 
-// roundTrip sends one request on the connection and reads its full response.
+// roundTrip sends one request without a body on the connection and reads its
+// full response.
 func (c *rawConn) roundTrip(t *testing.T, method, host string) *http.Response {
+	t.Helper()
+	return c.do(t, newRequest(t, method, host))
+}
+
+// do sends req on the connection and reads its full response.
+func (c *rawConn) do(t *testing.T, req *http.Request) *http.Response {
+	t.Helper()
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := req.Write(c); err != nil {
+		t.Fatalf("write %s: %v", req.Method, err)
+	}
+	resp, err := http.ReadResponse(c.r, req)
+	if err != nil {
+		t.Fatalf("read %s response: %v", req.Method, err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return resp
+}
+
+// readExactly reads len(want) raw bytes from the connection and fails unless
+// they equal want.
+func (c *rawConn) readExactly(t *testing.T, want string) {
+	t.Helper()
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(c.r, got); err != nil {
+		t.Fatalf("read %q: %v", want, err)
+	}
+	if string(got) != want {
+		t.Fatalf("read %q, want %q", got, want)
+	}
+}
+
+func newRequest(t *testing.T, method, host string) *http.Request {
 	t.Helper()
 	req, err := http.NewRequest(method, "http://"+host+"/", nil)
 	if err != nil {
 		t.Fatalf("new %s request: %v", method, err)
 	}
-	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
-	if err := req.Write(c); err != nil {
-		t.Fatalf("write %s: %v", method, err)
-	}
-	resp, err := http.ReadResponse(c.r, req)
-	if err != nil {
-		t.Fatalf("read %s response: %v", method, err)
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	return resp
+	return req
 }
