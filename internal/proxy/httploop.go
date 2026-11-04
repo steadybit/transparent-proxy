@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,8 +110,14 @@ func (c *httpConn) serve(ctx context.Context, req *http.Request) bool {
 	}
 
 	if action.HTTPStatus != 0 {
-		// The body must be consumed so the next request starts at its head.
-		_, _ = io.Copy(io.Discard, req.Body)
+		if expectsContinue(req) {
+			// The client has not sent its body and may or may not send it after
+			// this early answer, so the connection cannot carry another request.
+			req.Close = true
+		} else {
+			// The body must be consumed so the next request starts at its head.
+			_, _ = io.Copy(io.Discard, req.Body)
+		}
 		if err := writeHTTPResponse(c.client, req, action.HTTPStatus, action.HTTPHeaders, action.HTTPBody); err != nil {
 			c.log.Debug("failed to write injected status", slog.Any("err", err))
 			return false
@@ -141,6 +148,20 @@ func (c *httpConn) forward(ctx context.Context, req *http.Request) bool {
 	}
 	c.forwarded = true
 
+	// A client sending "Expect: 100-continue" waits to be told before sending
+	// its body. The proxy tells it and drops the expectation from the forwarded
+	// request, as nginx does, so the upstream answers only once.
+	if expectsContinue(req) {
+		req.Header.Del("Expect")
+		down := &countingWriter{w: c.client}
+		_, err := io.WriteString(down, "HTTP/1.1 100 Continue\r\n\r\n")
+		c.bytesDown += down.n
+		if err != nil {
+			c.log.Debug("failed to send 100 Continue", slog.Any("err", err))
+			return false
+		}
+	}
+
 	// Request.Write adds a Go User-Agent when the client sent none; an empty
 	// value suppresses it so the upstream sees the client's headers.
 	if _, ok := req.Header["User-Agent"]; !ok {
@@ -154,7 +175,7 @@ func (c *httpConn) forward(ctx context.Context, req *http.Request) bool {
 		return false
 	}
 
-	resp, err := http.ReadResponse(c.upstreamR, req)
+	resp, err := c.readFinalResponse(req)
 	if err != nil {
 		c.log.Debug("failed to read upstream response", slog.Any("err", err))
 		return false
@@ -175,6 +196,35 @@ func (c *httpConn) forward(ctx context.Context, req *http.Request) bool {
 	}
 	// The upstream is closing, and resp.Write told the client so too.
 	return !resp.Close
+}
+
+// readFinalResponse reads the upstream's response to req. Interim responses
+// such as 103 Early Hints come before it; they are passed to the client as
+// they arrive, otherwise the real response would be left on the connection and
+// read as the answer to the next request. 101 is returned like a final
+// response, since it ends HTTP on the connection.
+func (c *httpConn) readFinalResponse(req *http.Request) (*http.Response, error) {
+	for {
+		resp, err := http.ReadResponse(c.upstreamR, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 200 || resp.StatusCode == http.StatusSwitchingProtocols {
+			return resp, nil
+		}
+		down := &countingWriter{w: c.client}
+		err = resp.Write(down)
+		c.bytesDown += down.n
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+// expectsContinue reports whether the client waits for "100 Continue" before
+// sending the request body.
+func expectsContinue(req *http.Request) bool {
+	return strings.EqualFold(req.Header.Get("Expect"), "100-continue")
 }
 
 // tunnel completes a protocol upgrade such as WebSocket: it passes the

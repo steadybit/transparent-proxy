@@ -124,7 +124,9 @@ are faulted, however few connections it opens. A faulted request is answered
 by the proxy and the connection stays open; the others are forwarded over one
 upstream connection the proxy keeps open (and reopens if the server closed it
 while idle). An `abort` closes the connection, so the client reconnects for its
-next request.
+next request. A client sending `Expect: 100-continue` gets the `100 Continue`
+from the proxy when its request is forwarded, and the injected status right
+away (closing the connection) when it is faulted.
 The metrics count these requests as `requests_matched` and
 `requests_faulted` (also per host), so the observed share of faulted requests
 can be checked against `probability`; the `connections_*` counters stay per
@@ -143,9 +145,6 @@ Limits of the per-request path:
 - Whether a connection takes this path is decided by its first request. If
   that request matches no rule, the connection is spliced and later requests
   on it are not inspected.
-- A request with `Expect: 100-continue` waits for the client's own timeout
-  (typically ~1s) before its body is sent, since the proxy does not answer the
-  `100` itself.
 
 ## HTTPS response injection
 
