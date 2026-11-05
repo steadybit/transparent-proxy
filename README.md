@@ -203,8 +203,11 @@ window is rejected at startup rather than failing every handshake later.
 
 **Forwarding a request that is not faulted** — the proxy opens its own TLS
 connection to the connection's original destination, with the request's host
-as SNI, and **verifies the dependency's certificate against the system roots**.
-It never forwards to an endpoint it cannot verify: such a request gets a `502`
+as SNI, and **verifies the dependency's certificate against the system roots**,
+or, where the machine has none (the extension images ship none), against
+Mozilla's root CAs built into the binary. A dependency whose certificate comes
+from a private CA, trusted only by the workload's own truststore, cannot be
+verified this way. It never forwards to an endpoint it cannot verify: such a request gets a `502`
 and counts as `upstream_errors`, not as a fault. HTTP/2 is used towards the
 dependency when it offers it. A faulted response is fabricated, never a
 modified real one.

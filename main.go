@@ -39,6 +39,12 @@ import (
 	"github.com/steadybit/transparent-proxy/internal/proxy"
 	"github.com/steadybit/transparent-proxy/internal/supervisor"
 	"github.com/steadybit/transparent-proxy/internal/tlsinject"
+
+	// Mozilla's root CAs, used only where the machine has none. The proxy runs
+	// inside the extension's filesystem, and the extension images ship no root
+	// CAs, so without these a request forwarded on an intercepted HTTPS
+	// connection could not verify its dependency and would get a 502.
+	_ "golang.org/x/crypto/x509roots/fallback"
 )
 
 func main() {

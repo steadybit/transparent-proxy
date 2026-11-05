@@ -85,7 +85,7 @@ type Server struct {
 
 	// UpstreamRootCAs verifies the real dependency's certificate when a request
 	// on an intercepted HTTPS connection is forwarded to it. Nil uses the
-	// system roots.
+	// system roots, or the roots built into the binary where there are none.
 	UpstreamRootCAs *x509.CertPool
 
 	// listenPort and localAddrs are captured at Serve time for the self-loop
