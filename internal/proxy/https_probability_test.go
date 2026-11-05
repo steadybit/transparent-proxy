@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/steadybit/transparent-proxy/internal/fault"
+	"github.com/steadybit/transparent-proxy/internal/metrics"
 )
 
 // TestServer_TLSInject_ProbabilityAppliesPerRequestOnKeepAlive is the HTTPS
@@ -44,8 +45,9 @@ func TestServer_TLSInject_ProbabilityAppliesPerRequestOnKeepAlive(t *testing.T) 
 			upstream, dst := startH2CapableTLSUpstream(t)
 			ca, caPEM := newInterceptCA(t)
 			proxyAddr := serveProxy(t, &Server{
-				Faults:    fault.NewEngine([]fault.Rule{statusRule(upstreamHost, probability, http.StatusServiceUnavailable)}),
-				TLSInject: ca,
+				Faults:          fault.NewEngine([]fault.Rule{statusRule(upstreamHost, probability, http.StatusServiceUnavailable)}),
+				TLSInject:       ca,
+				UpstreamRootCAs: certPool(upstream),
 			}, dst)
 			client := newKeepAliveHTTPSClient(t, proxyAddr, upstream, caPEM, tc.http2)
 
@@ -119,4 +121,38 @@ func (c *keepAliveClient) sendGetsByProto(t *testing.T, url string, n int) (stat
 		protos[resp.Proto]++
 	}
 	return statuses, protos
+}
+
+// certPool trusts the test upstream's certificate, standing in for the system
+// roots that verify a real dependency.
+func certPool(upstream *httptest.Server) *x509.CertPool {
+	pool := x509.NewCertPool()
+	pool.AddCert(upstream.Certificate())
+	return pool
+}
+
+// TestServer_TLSInject_ForwardingVerifiesTheDependency forwards a request that
+// was not faulted to an upstream whose certificate the proxy does not trust.
+// The proxy must refuse rather than forward to a possible impostor: the client
+// gets a 502, and it is counted as an upstream error, not as a fault.
+func TestServer_TLSInject_ForwardingVerifiesTheDependency(t *testing.T) {
+	upstream, dst := startH2CapableTLSUpstream(t)
+	ca, caPEM := newInterceptCA(t)
+	m := metrics.New()
+	proxyAddr := serveProxy(t, &Server{
+		Faults:          fault.NewEngine([]fault.Rule{statusRule(upstreamHost, 0, http.StatusServiceUnavailable)}),
+		TLSInject:       ca,
+		Metrics:         m,
+		UpstreamRootCAs: x509.NewCertPool(), // trusts nothing
+	}, dst)
+	client := newKeepAliveHTTPSClient(t, proxyAddr, upstream, caPEM, false)
+
+	statuses := client.sendGets(t, "https://"+upstreamHost+"/", 1)
+	if statuses[http.StatusBadGateway] != 1 {
+		t.Fatalf("statuses = %v, want one 502", statuses)
+	}
+	s := m.Snapshot()
+	if s.UpstreamErrors != 1 || s.RequestsFaulted != 0 {
+		t.Fatalf("upstream errors / requests faulted = %d / %d, want 1 / 0", s.UpstreamErrors, s.RequestsFaulted)
+	}
 }
