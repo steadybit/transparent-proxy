@@ -68,7 +68,8 @@ The hostname/SNI targeting is what makes **one** tool work for both internal
   [How probability applies](#how-probability-applies)).
 - **Interception path (opt-in):** only when a CA is supplied via
   `--tls-ca-cert`/`--tls-ca-key` *and* a matching rule carries `httpStatus`, an
-  HTTPS connection is terminated so the response can be synthesized. See
+  HTTPS connection is terminated and handled request by request: faulted
+  requests get a synthesized response, the others are forwarded. See
   [HTTPS response injection](#https-response-injection). Without a CA the proxy
   never decrypts anything.
 
@@ -114,7 +115,8 @@ selectors match — an empty selector means "any".
 - `httpStatus` — synthesize this HTTP status (L7). Cleartext HTTP always; HTTPS
   only with an interception CA (see below).
 - `probability` — `[0,1]` chance to apply the fault (unset = always, `0` =
-  never), per request for cleartext HTTP and per connection otherwise.
+  never), per request for cleartext HTTP and for HTTPS through the interception
+  CA, per connection otherwise.
 
 ### How probability applies
 
@@ -132,9 +134,12 @@ The metrics count these requests as `requests_matched` and
 can be checked against `probability`; the `connections_*` counters stay per
 connection.
 
-**Everything else — per connection.** TLS without an interception CA, HTTPS
-through the interception CA, and non-HTTP TCP are rolled once when the
-connection opens, and every request on it shares that outcome. A keep-alive
+**HTTPS through the interception CA — per request** as well, for rules with an
+`httpStatus`: the connection is decrypted and each request rolled on its own
+(see [HTTPS response injection](#https-response-injection)).
+
+**Everything else — per connection.** TLS without an interception CA, and
+non-HTTP TCP, are rolled once when the connection opens, and every request on it shares that outcome. A keep-alive
 client that wins the roll keeps the connection, so the observed failure rate
 of its requests can be far below `probability`.
 
@@ -178,9 +183,12 @@ cat intercept-ca.crt intercept-ca.key |
 proxy before it installs any rules. The key must not be passphrase-protected.
 
 The proxy mints a short-lived certificate for the connection's SNI, signed by
-that CA, and answers the request itself. **HTTP/1.1 and HTTP/2 are both
-supported** — the response is delivered over whichever the client negotiates
-via ALPN.
+that CA, and handles the decrypted connection **request by request**: each
+request is matched by its `Host` (`:authority` on HTTP/2) and rolled against
+`probability` on its own. A faulted request is answered by the proxy; the others
+are forwarded to the real dependency. **HTTP/1.1 and HTTP/2 are both
+supported** — over whichever the client negotiates via ALPN, and the
+connection stays open between requests.
 
 **The CA is yours, and it need not be a root.** An intermediate issued by your
 own PKI works and is the better choice: you keep the root key offline, the
@@ -193,16 +201,28 @@ truststores of the workloads you want to fault. The proxy only signs with
 it; it never creates, rotates, or renews a CA. A CA already outside its validity
 window is rejected at startup rather than failing every handshake later.
 
-This is deliberately **one-sided**: the real dependency is never contacted. The
-proxy makes no trust decision about the origin's certificate, and a dependency
-behind mutual TLS is unaffected. The trade-off is that the response is
-fabricated rather than a modified real one.
+**Forwarding a request that is not faulted** — the proxy opens its own TLS
+connection to the connection's original destination, with the request's host
+as SNI, and **verifies the dependency's certificate against the system roots**.
+It never forwards to an endpoint it cannot verify: such a request gets a `502`
+and counts as `upstream_errors`, not as a fault. HTTP/2 is used towards the
+dependency when it offers it. A faulted response is fabricated, never a
+modified real one.
+
+**Every matched connection is decrypted**, whatever the `probability`, since
+the roll happens per request inside it. That widens the impact compared with
+splicing connections that are not faulted:
+
+- a workload that does not trust the CA, or pins certificates, fails **all**
+  its requests to the matched hostnames, not only the faulted share;
+- a dependency that requires **mutual TLS** cannot be reached through the
+  proxy: it forwards without the workload's client certificate, so requests
+  that are not faulted get a `502`. Do not target such dependencies.
 
 **When it does not apply** — the connection is spliced through untouched:
 
 - no CA configured, or the client sent no SNI;
-- the rule carries no `httpStatus`;
-- the connection lost the `probability` roll.
+- the rule carries no `httpStatus`.
 
 **When the client refuses** — if the workload does not trust the CA (or pins
 certificates) it either fails the handshake, or, under TLS 1.3, completes it and
@@ -210,6 +230,8 @@ then walks away without sending a request. Both are counted as
 `tls_intercept_rejected` and deliberately *not* as a fault, so a non-zero value
 is the signal that the CA is missing from the target's truststore rather than a
 silent no-op. Only a response actually written counts as an injected fault.
+Requests count into `requests_matched` and `requests_faulted`, as on cleartext
+HTTP.
 
 > Interception requires a key that can impersonate any HTTPS endpoint to
 > anything trusting the CA. Treat it as a test/staging capability and keep the
