@@ -68,52 +68,6 @@ func (e *RejectedError) Error() string {
 }
 func (e *RejectedError) Unwrap() error { return e.Err }
 
-// Request is one interception: what to answer with, and how to report it.
-type Request struct {
-	Response         Response
-	HandshakeTimeout time.Duration
-	// OnDelivered is invoked the moment the first forged response is written,
-	// at most once per connection.
-	//
-	// Delivery must be reported from here rather than inferred from ServeForged
-	// returning: an HTTP/2 client pools the connection for the whole attack, so
-	// waiting for the connection to end would leave a fault that is demonstrably
-	// in effect counted as "matched but never faulted" — the proxy's canonical
-	// silent-no-op signature.
-	OnDelivered func()
-}
-
-// ServeForged terminates TLS on conn using a certificate minted for the
-// client's SNI, then answers requests with req.Response. clientHello replays
-// the bytes already consumed while sniffing the SNI, so the handshake sees the
-// original stream; pass nil when nothing was consumed.
-//
-// It blocks until the connection is finished — for HTTP/1.1 that is one
-// request, for HTTP/2 until the client goes away — or until ctx is cancelled,
-// which closes the connection so an attack teardown never leaks a goroutine.
-//
-// A nil return means the connection ended without the client refusing us; it is
-// not a claim that anything was delivered. Use OnDelivered for that.
-func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte, req Request) error {
-	forged := req.Response
-	return c.Serve(ctx, conn, clientHello, req.HandshakeTimeout, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// One forged response per HTTP/1.1 connection: the client must not reuse
-		// a connection we took over from its real dependency. Connection is
-		// hop-by-hop and illegal in HTTP/2, where the client owns the lifetime —
-		// so this is set per protocol rather than by disabling keep-alives, which
-		// would make the HTTP/2 server send an immediate GOAWAY.
-		if r.ProtoMajor == 1 {
-			w.Header().Set("Connection", "close")
-		}
-		forged.ServeHTTP(w, r)
-		// Report at the point of writing, not when the connection ends: an HTTP/2
-		// client holds the connection open for the whole attack.
-		if req.OnDelivered != nil {
-			req.OnDelivered()
-		}
-	}))
-}
-
 // Serve terminates TLS on conn using a certificate minted for the client's SNI
 // and serves every request on it with handler, over HTTP/1.1 or HTTP/2,
 // whichever the client negotiates. clientHello replays the bytes already
