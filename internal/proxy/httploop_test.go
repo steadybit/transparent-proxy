@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"testing"
 	"time"
@@ -190,6 +191,118 @@ func startUpgradeUpstream(t *testing.T, greeting string) netip.AddrPort {
 	return ln.Addr().(*net.TCPAddr).AddrPort()
 }
 
+// expectContinueHead is the head of a 5-byte POST whose client waits for
+// "100 Continue" before sending the body.
+const expectContinueHead = "POST / HTTP/1.1\r\nHost: dependency.test\r\n" +
+	"Content-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+
+// TestServeHTTP_ExpectContinueForwarded sends a request that waits for
+// "100 Continue" before its body. The proxy must answer it, or the client
+// waits for its own timeout (curl: 1s) before sending the body anyway.
+func TestServeHTTP_ExpectContinueForwarded(t *testing.T) {
+	const host = "dependency.test"
+
+	upstream := startBodyEchoUpstream(t)
+	proxyAddr := startProxy(t, upstream, fault.NewEngine([]fault.Rule{
+		statusRule(host, 0, http.StatusServiceUnavailable),
+	}))
+	conn := dialRaw(t, proxyAddr)
+
+	conn.send(t, expectContinueHead)
+	if resp := conn.readResponse(t, 500*time.Millisecond); resp.StatusCode != http.StatusContinue {
+		t.Fatalf("interim status = %d, want 100", resp.StatusCode)
+	}
+	conn.send(t, "hello")
+	resp := conn.readResponse(t, 2*time.Second)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("final status = %d, want 200", resp.StatusCode)
+	}
+	if body, _ := io.ReadAll(resp.Body); string(body) != "hello" {
+		t.Fatalf("upstream received body %q, want %q", body, "hello")
+	}
+
+	if resp := conn.roundTrip(t, http.MethodGet, host); resp.StatusCode != http.StatusOK {
+		t.Fatalf("next GET status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestServeHTTP_ExpectContinueFaulted sends a request that waits for
+// "100 Continue" to a faulted dependency. The injected status must come back
+// at once, without waiting for a body the client has not sent.
+func TestServeHTTP_ExpectContinueFaulted(t *testing.T) {
+	const host = "dependency.test"
+
+	upstream := startCountingUpstream(t)
+	proxyAddr := startProxy(t, upstream.addr, fault.NewEngine([]fault.Rule{
+		statusRule(host, 1, http.StatusServiceUnavailable),
+	}))
+	conn := dialRaw(t, proxyAddr)
+
+	conn.send(t, expectContinueHead)
+	resp := conn.readResponse(t, 500*time.Millisecond)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	// The client may or may not send the body after an early final response,
+	// so the connection cannot carry another request.
+	if !resp.Close {
+		t.Fatal("response should close the connection")
+	}
+}
+
+// TestServeHTTP_ForwardsInterimResponses forwards a request to an upstream
+// that sends 103 Early Hints before the real response. Both must reach the
+// client, and the connection must still carry the next request.
+func TestServeHTTP_ForwardsInterimResponses(t *testing.T) {
+	const host = "dependency.test"
+
+	upstream := startEarlyHintsUpstream(t)
+	proxyAddr := startProxy(t, upstream, fault.NewEngine([]fault.Rule{
+		statusRule(host, 0, http.StatusServiceUnavailable),
+	}))
+	conn := dialRaw(t, proxyAddr)
+
+	conn.send(t, "GET / HTTP/1.1\r\nHost: dependency.test\r\n\r\n")
+	if resp := conn.readResponse(t, 2*time.Second); resp.StatusCode != http.StatusEarlyHints {
+		t.Fatalf("interim status = %d, want 103", resp.StatusCode)
+	}
+	resp := conn.readResponse(t, 2*time.Second)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("final status = %d, want 200", resp.StatusCode)
+	}
+	if body, _ := io.ReadAll(resp.Body); string(body) != "ok" {
+		t.Fatalf("final body = %q, want %q", body, "ok")
+	}
+
+	if resp := conn.roundTrip(t, http.MethodGet, host); resp.StatusCode != http.StatusEarlyHints {
+		t.Fatalf("next GET status = %d, want 103 first", resp.StatusCode)
+	}
+}
+
+// startBodyEchoUpstream starts an HTTP server that answers every request with
+// its own body.
+func startBodyEchoUpstream(t *testing.T) netip.AddrPort {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(w, r.Body)
+	}))
+	t.Cleanup(srv.Close)
+	return netip.MustParseAddrPort(srv.Listener.Addr().String())
+}
+
+// startEarlyHintsUpstream starts a keep-alive server that answers every
+// request with 103 Early Hints followed by 200 "ok".
+func startEarlyHintsUpstream(t *testing.T) netip.AddrPort {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Link", "</style.css>; rel=preload")
+		w.WriteHeader(http.StatusEarlyHints)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	return netip.MustParseAddrPort(srv.Listener.Addr().String())
+}
+
 // rawConn is one client connection to the proxy, used for sending requests in
 // sequence and reading their responses, so a test controls exactly what goes
 // over a single keep-alive connection.
@@ -228,6 +341,27 @@ func (c *rawConn) do(t *testing.T, req *http.Request) *http.Response {
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+	return resp
+}
+
+// send writes raw bytes on the connection.
+func (c *rawConn) send(t *testing.T, raw string) {
+	t.Helper()
+	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.WriteString(c, raw); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+// readResponse reads the next response, interim (1xx) or final, failing if it
+// does not arrive within timeout. A final response's body is left unread.
+func (c *rawConn) readResponse(t *testing.T, timeout time.Duration) *http.Response {
+	t.Helper()
+	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	resp, err := http.ReadResponse(c.r, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
 	return resp
 }
 
