@@ -206,8 +206,20 @@ connection to the connection's original destination, with the request's host
 as SNI, and **verifies the dependency's certificate against the system roots**,
 or, where the machine has none (the extension images ship none), against
 Mozilla's root CAs built into the binary. A dependency whose certificate comes
-from a private CA, trusted only by the workload's own truststore, cannot be
-verified this way. It never forwards to an endpoint it cannot verify: such a request gets a `502`
+from a private CA, trusted only by the workload's own truststore, needs that CA
+given to the proxy too:
+
+```bash
+transparent-proxy ... --upstream-ca-file /path/to/company-ca.pem
+```
+
+These CAs are trusted **in addition to** the system (or built-in) roots, and the
+dependency's hostname is still checked. Extensions pass a custom CA through
+`SSL_CERT_DIR` / `SSL_CERT_FILE` instead, which Go reads as system roots; the
+built-in roots are then still checked, so public dependencies keep verifying.
+For test environments, `--upstream-insecure-skip-verify` forwards without
+verifying the dependency at all; the proxy logs a warning when it is set. It
+never forwards to an endpoint it cannot verify: such a request gets a `502`
 and counts as `upstream_errors`, not as a fault. HTTP/2 is used towards the
 dependency when it offers it. A faulted response is fabricated, never a
 modified real one.
