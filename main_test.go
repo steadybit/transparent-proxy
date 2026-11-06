@@ -4,6 +4,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -82,5 +84,23 @@ func TestServerFirstTimeout(t *testing.T) {
 				t.Fatalf("serverFirstTimeout = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+func Test_loadUpstreamCAs(t *testing.T) {
+	pool, err := loadUpstreamCAs("")
+	if pool != nil || err != nil {
+		t.Fatalf("empty path = %v, %v; want no pool and no error", pool, err)
+	}
+
+	if pool, err := loadUpstreamCAs("testdata/example.com-chain.pem"); pool == nil || err != nil {
+		t.Fatalf("PEM bundle = %v, %v; want a pool", pool, err)
+	}
+
+	garbage := filepath.Join(t.TempDir(), "garbage.pem")
+	if err := os.WriteFile(garbage, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadUpstreamCAs(garbage); err == nil {
+		t.Fatal("a file without certificates should be rejected")
 	}
 }

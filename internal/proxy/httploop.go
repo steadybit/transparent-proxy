@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/steadybit/transparent-proxy/internal/fault"
@@ -80,7 +81,7 @@ type httpConn struct {
 	upstream  *net.TCPConn
 	upstreamR *bufio.Reader
 
-	faulted            bool
+	faulted            atomic.Bool
 	forwarded          bool
 	bytesUp, bytesDown int64
 }
@@ -90,7 +91,7 @@ type httpConn struct {
 func (c *httpConn) serve(ctx context.Context, req *http.Request) bool {
 	host := hostWithoutPort(req.Host)
 	action := c.s.Faults.Match(c.dst, host)
-	c.countRequest(host, action)
+	c.s.countRequest(host, c.identity, action, &c.faulted)
 
 	if action.Abort {
 		c.s.Metrics.Aborted()
@@ -292,21 +293,21 @@ func (c *httpConn) upstreamReusable() bool {
 }
 
 // countRequest records a request that matched a rule and, if its fault applies,
-// that it was faulted. The connection itself counts as faulted once, on its
-// first faulted request.
-func (c *httpConn) countRequest(host string, action fault.Action) {
+// that it was faulted. The connection, identified by identity, counts as
+// faulted once, on its first faulted request; connFaulted tracks that and may
+// be shared by concurrent requests (HTTP/2).
+func (s *Server) countRequest(host, identity string, action fault.Action, connFaulted *atomic.Bool) {
 	if action.Rule == "" {
 		return
 	}
-	c.s.Metrics.MatchedRequest(host)
+	s.Metrics.MatchedRequest(host)
 	if !action.Faulted() {
 		return
 	}
-	c.s.Metrics.FaultedRequest(host)
-	if !c.faulted {
-		c.faulted = true
-		c.s.Metrics.Faulted()
-		c.s.Metrics.FaultedHost(c.identity)
+	s.Metrics.FaultedRequest(host)
+	if connFaulted.CompareAndSwap(false, true) {
+		s.Metrics.Faulted()
+		s.Metrics.FaultedHost(identity)
 	}
 }
 

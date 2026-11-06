@@ -19,9 +19,9 @@ import (
 
 const testSNI = "api.anthropic.com"
 
-// serveForgedOnce accepts a single connection and injects r into it, returning
-// the listener address and a channel carrying ServeForged's result.
-func serveForgedOnce(t *testing.T, ca *CA, r Response) (string, <-chan error) {
+// serveOnce accepts a single connection and serves it with handler, returning
+// the listener address and a channel carrying Serve's result.
+func serveOnce(t *testing.T, ca *CA, handler http.Handler) (string, <-chan error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -36,7 +36,7 @@ func serveForgedOnce(t *testing.T, ca *CA, r Response) (string, <-chan error) {
 			ch <- aerr
 			return
 		}
-		ch <- ca.ServeForged(context.Background(), conn, nil, Request{Response: r, HandshakeTimeout: 5 * time.Second})
+		ch <- ca.Serve(context.Background(), conn, nil, 5*time.Second, handler)
 	}()
 	return ln.Addr().String(), ch
 }
@@ -64,19 +64,19 @@ func waitServed(t *testing.T, ch <-chan error) error {
 	case err := <-ch:
 		return err
 	case <-time.After(10 * time.Second):
-		t.Fatal("ServeForged did not return")
+		t.Fatal("Serve did not return")
 		return nil
 	}
 }
 
-func Test_ServeForged_http1(t *testing.T) {
+func Test_Serve_http1(t *testing.T) {
 	ca, caPEM := mustLoadTestCA(t)
-	addr, ch := serveForgedOnce(t, ca, Response{
+	addr, ch := serveOnce(t, ca, Response{
 		Status:  503,
 		Body:    `{"error":"injected"}`,
 		Headers: map[string]string{"Retry-After": "30", "Content-Type": "application/json"},
 	})
-	client, _ := clientTrusting(t, caPEM, false)
+	client, tr := clientTrusting(t, caPEM, false)
 
 	resp, err := client.Get("https://" + addr + "/v1/messages")
 	if err != nil {
@@ -101,16 +101,49 @@ func Test_ServeForged_http1(t *testing.T) {
 	if got := resp.Header.Get("Content-Type"); got != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", got)
 	}
+
+	// The connection is kept alive for further requests; releasing it lets the
+	// server finish.
+	tr.CloseIdleConnections()
 	if err := waitServed(t, ch); err != nil {
-		t.Fatalf("ServeForged: %v", err)
+		t.Fatalf("Serve: %v", err)
+	}
+}
+
+// Serve answers every request on a kept-alive connection, which is what lets
+// the caller decide per request instead of per connection.
+func Test_Serve_keepAliveServesEveryRequest(t *testing.T) {
+	ca, caPEM := mustLoadTestCA(t)
+	var served atomic.Int64
+	addr, ch := serveOnce(t, ca, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		served.Add(1)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	client, tr := clientTrusting(t, caPEM, false)
+
+	for i := range 3 {
+		resp, err := client.Get("https://" + addr + "/")
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+	}
+	if got := served.Load(); got != 3 {
+		t.Fatalf("served %d requests, want 3", got)
+	}
+
+	tr.CloseIdleConnections()
+	if err := waitServed(t, ch); err != nil {
+		t.Fatalf("Serve: %v", err)
 	}
 }
 
 // The dependency this targets speaks HTTP/2, so serving the forged response
 // over h2 is the case that matters most in practice.
-func Test_ServeForged_http2(t *testing.T) {
+func Test_Serve_http2(t *testing.T) {
 	ca, caPEM := mustLoadTestCA(t)
-	addr, ch := serveForgedOnce(t, ca, Response{Status: 503})
+	addr, ch := serveOnce(t, ca, Response{Status: 503})
 	client, tr := clientTrusting(t, caPEM, true)
 
 	resp, err := client.Get("https://" + addr + "/v1/messages")
@@ -134,16 +167,16 @@ func Test_ServeForged_http2(t *testing.T) {
 	// server finish.
 	tr.CloseIdleConnections()
 	if err := waitServed(t, ch); err != nil {
-		t.Fatalf("ServeForged: %v", err)
+		t.Fatalf("Serve: %v", err)
 	}
 }
 
 // The canonical failure mode: the workload does not trust our CA. It must be
 // reported as a HandshakeError so the caller can count it and say so, rather
 // than looking like a silent no-op.
-func Test_ServeForged_untrustedClientYieldsHandshakeError(t *testing.T) {
+func Test_Serve_untrustedClientYieldsHandshakeError(t *testing.T) {
 	ca, _ := mustLoadTestCA(t)
-	addr, ch := serveForgedOnce(t, ca, Response{Status: 503})
+	addr, ch := serveOnce(t, ca, Response{Status: 503})
 
 	tr := &http.Transport{TLSClientConfig: &tls.Config{
 		RootCAs:    x509.NewCertPool(), // trusts nothing
@@ -168,10 +201,10 @@ func Test_ServeForged_untrustedClientYieldsHandshakeError(t *testing.T) {
 // it dislikes the certificate — the client simply walks away without sending a
 // request. Observed with curl/OpenSSL against a real proxy, where it made a
 // rejected connection look like a successfully injected fault. A completed
-// handshake is therefore not proof of delivery; an actual response is.
-func Test_ServeForged_rejectedAfterHandshakeIsNotDelivery(t *testing.T) {
+// handshake is therefore not proof of trust; an actual request is.
+func Test_Serve_rejectedAfterHandshakeIsNotDelivery(t *testing.T) {
 	ca, caPEM := mustLoadTestCA(t)
-	addr, ch := serveForgedOnce(t, ca, Response{Status: 503})
+	addr, ch := serveOnce(t, ca, Response{Status: 503})
 
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPEM)
@@ -191,7 +224,7 @@ func Test_ServeForged_rejectedAfterHandshakeIsNotDelivery(t *testing.T) {
 	err = waitServed(t, ch)
 	var rej *RejectedError
 	if !errors.As(err, &rej) {
-		t.Fatalf("err = %v, want a *RejectedError (nothing was ever delivered)", err)
+		t.Fatalf("err = %v, want a *RejectedError (no request was ever sent)", err)
 	}
 	if rej.Stage != "post-handshake" {
 		t.Fatalf("stage = %q, want post-handshake", rej.Stage)
@@ -199,10 +232,10 @@ func Test_ServeForged_rejectedAfterHandshakeIsNotDelivery(t *testing.T) {
 }
 
 // Regression: an HTTP/2 client pools the connection for the whole attack, so
-// delivery must be reported when the response is written — not when the
-// connection ends. Reporting it late leaves a demonstrably working fault
-// counted as "matched but never faulted", the proxy's silent-no-op signature.
-func Test_ServeForged_reportsDeliveryBeforeConnectionCloses(t *testing.T) {
+// each request must reach the handler while the connection is open — not when
+// it ends. Otherwise the caller could only count a demonstrably working fault
+// late, as "matched but never faulted", the proxy's silent-no-op signature.
+func Test_Serve_handlesRequestsBeforeConnectionCloses(t *testing.T) {
 	ca, caPEM := mustLoadTestCA(t)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -219,11 +252,10 @@ func Test_ServeForged_reportsDeliveryBeforeConnectionCloses(t *testing.T) {
 			ch <- aerr
 			return
 		}
-		ch <- ca.ServeForged(context.Background(), conn, nil, Request{
-			Response:         Response{Status: 503},
-			HandshakeTimeout: 5 * time.Second,
-			OnDelivered:      func() { delivered <- struct{}{} },
-		})
+		ch <- ca.Serve(context.Background(), conn, nil, 5*time.Second, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			Response{Status: 503}.ServeHTTP(w, r)
+			delivered <- struct{}{}
+		}))
 	}()
 
 	client, tr := clientTrusting(t, caPEM, true)
@@ -241,23 +273,23 @@ func Test_ServeForged_reportsDeliveryBeforeConnectionCloses(t *testing.T) {
 	select {
 	case <-delivered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("delivery was not reported while the h2 connection was still open")
+		t.Fatal("the request did not reach the handler while the h2 connection was open")
 	}
 	select {
 	case err := <-ch:
-		t.Fatalf("ServeForged returned early (%v); the h2 connection should still be open", err)
+		t.Fatalf("Serve returned early (%v); the h2 connection should still be open", err)
 	default:
 	}
 
 	tr.CloseIdleConnections()
 	if err := waitServed(t, ch); err != nil {
-		t.Fatalf("ServeForged: %v", err)
+		t.Fatalf("Serve: %v", err)
 	}
 }
 
-// Teardown must never be booked as a delivered fault: nothing was written, so
-// OnDelivered must not fire.
-func Test_ServeForged_cancelDoesNotReportDelivery(t *testing.T) {
+// Teardown must never be booked as a request or a rejection: the client sent
+// nothing, so the handler must not run.
+func Test_Serve_cancelBeforeAnyRequest(t *testing.T) {
 	ca, caPEM := mustLoadTestCA(t)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -267,7 +299,7 @@ func Test_ServeForged_cancelDoesNotReportDelivery(t *testing.T) {
 	defer func() { _ = ln.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	var deliveries atomic.Int64
+	var handled atomic.Int64
 	ch := make(chan error, 1)
 	go func() {
 		conn, aerr := ln.Accept()
@@ -275,11 +307,9 @@ func Test_ServeForged_cancelDoesNotReportDelivery(t *testing.T) {
 			ch <- aerr
 			return
 		}
-		ch <- ca.ServeForged(ctx, conn, nil, Request{
-			Response:         Response{Status: 503},
-			HandshakeTimeout: 5 * time.Second,
-			OnDelivered:      func() { deliveries.Add(1) },
-		})
+		ch <- ca.Serve(ctx, conn, nil, 5*time.Second, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			handled.Add(1)
+		}))
 	}()
 
 	pool := x509.NewCertPool()
@@ -299,12 +329,12 @@ func Test_ServeForged_cancelDoesNotReportDelivery(t *testing.T) {
 			t.Fatalf("teardown was misreported as a client rejection: %v", err)
 		}
 	}
-	if got := deliveries.Load(); got != 0 {
-		t.Fatalf("OnDelivered fired %d times on teardown; nothing was written", got)
+	if got := handled.Load(); got != 0 {
+		t.Fatalf("the handler ran %d times on teardown; no request was sent", got)
 	}
 }
 
-func Test_ServeForged_cancelledContextClosesConnection(t *testing.T) {
+func Test_Serve_cancelledContextClosesConnection(t *testing.T) {
 	ca, caPEM := mustLoadTestCA(t)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -321,7 +351,7 @@ func Test_ServeForged_cancelledContextClosesConnection(t *testing.T) {
 			ch <- aerr
 			return
 		}
-		ch <- ca.ServeForged(ctx, conn, nil, Request{Response: Response{Status: 503}, HandshakeTimeout: 5 * time.Second})
+		ch <- ca.Serve(ctx, conn, nil, 5*time.Second, Response{Status: 503})
 	}()
 
 	// HTTP/2 holds the connection open after the response, so once a reply has
@@ -349,7 +379,7 @@ func Test_ServeForged_cancelledContextClosesConnection(t *testing.T) {
 
 	cancel()
 	if err := waitServed(t, ch); err != nil && !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("ServeForged after cancel: %v", err)
+		t.Fatalf("Serve after cancel: %v", err)
 	}
 }
 
@@ -379,17 +409,19 @@ func Test_Response_defaults(t *testing.T) {
 // HTTP/1.1; a caller supplying one must not be able to corrupt the response.
 func Test_Response_stripsHopByHopHeaders(t *testing.T) {
 	ca, caPEM := mustLoadTestCA(t)
-	addr, ch := serveForgedOnce(t, ca, Response{
+	addr, ch := serveOnce(t, ca, Response{
 		Status:  503,
-		Headers: map[string]string{"Connection": "keep-alive", "Transfer-Encoding": "chunked", "X-Kept": "yes"},
+		Headers: map[string]string{"Connection": "close", "Transfer-Encoding": "chunked", "X-Kept": "yes"},
 	})
-	client, _ := clientTrusting(t, caPEM, false)
+	client, tr := clientTrusting(t, caPEM, false)
 
 	resp, err := client.Get("https://" + addr + "/")
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	defer resp.Body.Close()
+	// Read to the end so the connection goes idle and can be released below.
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 
 	if got := resp.Header.Get("X-Kept"); got != "yes" {
 		t.Fatalf("X-Kept = %q, want yes", got)
@@ -397,8 +429,13 @@ func Test_Response_stripsHopByHopHeaders(t *testing.T) {
 	if got := resp.Header.Get("Transfer-Encoding"); got != "" {
 		t.Fatalf("Transfer-Encoding leaked through: %q", got)
 	}
+	// A rule's Connection header must not decide the connection's lifetime.
+	if resp.Close {
+		t.Fatal("the rule's Connection: close leaked through")
+	}
+	tr.CloseIdleConnections()
 	if err := waitServed(t, ch); err != nil {
-		t.Fatalf("ServeForged: %v", err)
+		t.Fatalf("Serve: %v", err)
 	}
 }
 

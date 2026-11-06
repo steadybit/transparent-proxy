@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -67,36 +68,22 @@ func (e *RejectedError) Error() string {
 }
 func (e *RejectedError) Unwrap() error { return e.Err }
 
-// Request is one interception: what to answer with, and how to report it.
-type Request struct {
-	Response         Response
-	HandshakeTimeout time.Duration
-	// OnDelivered is invoked the moment the first forged response is written,
-	// at most once per connection.
-	//
-	// Delivery must be reported from here rather than inferred from ServeForged
-	// returning: an HTTP/2 client pools the connection for the whole attack, so
-	// waiting for the connection to end would leave a fault that is demonstrably
-	// in effect counted as "matched but never faulted" — the proxy's canonical
-	// silent-no-op signature.
-	OnDelivered func()
-}
-
-// ServeForged terminates TLS on conn using a certificate minted for the
-// client's SNI, then answers requests with req.Response. clientHello replays
-// the bytes already consumed while sniffing the SNI, so the handshake sees the
-// original stream; pass nil when nothing was consumed.
+// Serve terminates TLS on conn using a certificate minted for the client's SNI
+// and serves every request on it with handler, over HTTP/1.1 or HTTP/2,
+// whichever the client negotiates. clientHello replays the bytes already
+// consumed while sniffing the SNI; pass nil when nothing was consumed.
 //
-// It blocks until the connection is finished — for HTTP/1.1 that is one
-// request, for HTTP/2 until the client goes away — or until ctx is cancelled,
-// which closes the connection so an attack teardown never leaks a goroutine.
+// It blocks until the client closes the connection, or until ctx is cancelled,
+// which closes it so an attack teardown never leaks a goroutine.
 //
-// A nil return means the connection ended without the client refusing us; it is
-// not a claim that anything was delivered. Use OnDelivered for that.
-func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte, req Request) error {
+// The client accepting our certificate is only proven by it sending a request:
+// a TLS 1.3 client completes the handshake before reporting a certificate it
+// dislikes, by walking away. A connection that ends without any request is
+// therefore a *RejectedError, or ErrNotDelivered when ctx was cancelled.
+func (c *CA) Serve(ctx context.Context, conn net.Conn, clientHello []byte, handshakeTimeout time.Duration, handler http.Handler) error {
 	tc := tls.Server(replayConn(conn, clientHello), c.ServerTLSConfig())
 
-	hctx, cancel := context.WithTimeout(ctx, req.HandshakeTimeout)
+	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 	if err := tc.HandshakeContext(hctx); err != nil {
 		switch {
@@ -108,7 +95,7 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 			// Our own deadline elapsed. A slow client or a loaded proxy is not a
 			// rejection, and reporting it as one sends the operator hunting for a
 			// truststore problem that does not exist.
-			return fmt.Errorf("tls handshake did not complete within %s: %w", req.HandshakeTimeout, err)
+			return fmt.Errorf("tls handshake did not complete within %s: %w", handshakeTimeout, err)
 		case isCertError(err):
 			// We could not produce a certificate (expired CA, signing failure, no
 			// SNI). Blaming the client's truststore here would point the operator at
@@ -131,20 +118,12 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 		}
 	}()
 
-	// delivered is the only trustworthy proof the fault landed: a completed
-	// handshake is not one, because a TLS 1.3 client reports a certificate it
-	// dislikes only by walking away afterwards.
-	var delivered atomic.Bool
-	if err := serveOne(tc, req, &delivered); err != nil {
+	var state connState
+	if err := serveOne(tc, state.track(handler)); err != nil {
 		return err
 	}
-	// Claim the flag rather than reading it. An HTTP/2 handler goroutine can
-	// still be finishing as ServeConn returns, so a plain read could see "not
-	// delivered", have the caller count a rejection, and then have the straggler
-	// fire OnDelivered — booking one connection into two mutually exclusive
-	// buckets. Winning this CAS means nothing was delivered and nothing can be.
-	if !delivered.CompareAndSwap(false, true) {
-		return nil // delivered; OnDelivered has fired or is firing
+	if !state.end() {
+		return nil // at least one request was served
 	}
 	if ctx.Err() != nil {
 		// Torn down mid-connection: not the client's doing.
@@ -152,6 +131,35 @@ func (c *CA) ServeForged(ctx context.Context, conn net.Conn, clientHello []byte,
 	}
 	return &RejectedError{Stage: "post-handshake"}
 }
+
+// connState records whether a connection served any request. It is claimed
+// with a CAS from both sides: an HTTP/2 handler goroutine can still be starting
+// as the server returns, so a plain flag could have the caller count a
+// rejection while that straggler serves a request — booking one connection
+// into two mutually exclusive buckets.
+type connState struct{ v atomic.Int32 }
+
+const (
+	connIdle   int32 = iota // no request yet
+	connServed              // at least one request reached the handler
+	connEnded               // ended without any request
+)
+
+// track wraps handler so the first request marks the connection served. A
+// request arriving after the connection was already reported as ended is
+// dropped rather than served.
+func (s *connState) track(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.v.CompareAndSwap(connIdle, connServed) && s.v.Load() == connEnded {
+			panic(http.ErrAbortHandler)
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
+// end reports whether the connection ended without serving any request, and
+// from then on drops late requests.
+func (s *connState) end() bool { return s.v.CompareAndSwap(connIdle, connEnded) }
 
 // ErrNotDelivered reports a connection that ended without a response and
 // without the client refusing us — teardown, essentially. It is returned so the
@@ -170,10 +178,10 @@ func isCertError(err error) bool {
 // HTTP/2 support for free: a TLSConfig advertising h2 makes Serve install the
 // stdlib's HTTP/2 handler, and net/http then dispatches on the protocol ALPN
 // negotiated during the handshake above.
-func serveOne(tc *tls.Conn, req Request, delivered *atomic.Bool) error {
+func serveOne(tc *tls.Conn, handler http.Handler) error {
 	ln := newOneShotListener(tc)
 	srv := &http.Server{
-		Handler:           req.handler(delivered),
+		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		// A TLSConfig advertising h2 is what makes Serve install the stdlib's
 		// HTTP/2 handler. net/http then picks the protocol by type-asserting the
@@ -198,10 +206,11 @@ func serveOne(tc *tls.Conn, req Request, delivered *atomic.Bool) error {
 	return nil
 }
 
-// handler writes the forged response. It is shared by the HTTP/1.1 and HTTP/2
-// paths, so both produce an identical status, header set and body.
-func (q Request) handler(delivered *atomic.Bool) http.Handler {
-	r := q.Response
+// ServeHTTP writes the forged response, so Response can be served for any
+// request. It is shared by the HTTP/1.1 and HTTP/2 paths, so both produce an
+// identical status, header set and body. It leaves the connection's lifetime
+// to the caller.
+func (r Response) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	status := r.resolvedStatus()
 	body := r.resolvedBody()
 	// 204 and 304 must not carry a body; net/http would strip it and the
@@ -209,36 +218,23 @@ func (q Request) handler(delivered *atomic.Bool) http.Handler {
 	if status == http.StatusNoContent || status == http.StatusNotModified {
 		body = ""
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		h := w.Header()
-		h.Set("Content-Type", "text/plain; charset=utf-8")
-		for k, v := range r.Headers {
-			h.Set(textproto.CanonicalMIMEHeaderKey(k), v)
+	h := w.Header()
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	for k, v := range r.Headers {
+		k = textproto.CanonicalMIMEHeaderKey(k)
+		// Only the rule's own headers are filtered: a hop-by-hop header the
+		// caller set on w (Connection: close) is the caller's decision.
+		if !slices.Contains(hopByHop, k) {
+			h.Set(k, v)
 		}
-		for _, k := range hopByHop {
-			h.Del(k)
-		}
-		if body != "" {
-			h.Set("Content-Length", strconv.Itoa(len(body)))
-		}
-		// One forged response per HTTP/1.1 connection: the client must not reuse
-		// a connection we took over from its real dependency. Connection is
-		// hop-by-hop and illegal in HTTP/2, where the client owns the lifetime —
-		// so this is set per protocol rather than by disabling keep-alives, which
-		// would make the HTTP/2 server send an immediate GOAWAY.
-		if req.ProtoMajor == 1 {
-			h.Set("Connection", "close")
-		}
-		w.WriteHeader(status)
-		if body != "" {
-			_, _ = io.WriteString(w, body)
-		}
-		// Report at the point of writing, not when the connection ends: an HTTP/2
-		// client holds the connection open for the whole attack.
-		if delivered.CompareAndSwap(false, true) && q.OnDelivered != nil {
-			q.OnDelivered()
-		}
-	})
+	}
+	if body != "" {
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+	}
+	w.WriteHeader(status)
+	if body != "" {
+		_, _ = io.WriteString(w, body)
+	}
 }
 
 // resolvedStatus rejects 1xx as out of range: net/http treats an informational

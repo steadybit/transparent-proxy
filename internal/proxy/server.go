@@ -10,6 +10,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
 	"log/slog"
@@ -81,6 +82,16 @@ type Server struct {
 	// Nil (the default) means TLS is never decrypted — HTTPS connections are
 	// spliced through untouched exactly as before.
 	TLSInject *tlsinject.CA
+
+	// UpstreamTrustedCAs are trusted, in addition to the system roots (or the
+	// roots built into the binary where there are none), to verify the real
+	// dependency when a request on an intercepted HTTPS connection is
+	// forwarded to it: a dependency whose certificate comes from a private CA.
+	UpstreamTrustedCAs *x509.CertPool
+
+	// UpstreamInsecureSkipVerify forwards to the real dependency without
+	// verifying its certificate. For test environments only.
+	UpstreamInsecureSkipVerify bool
 
 	// listenPort and localAddrs are captured at Serve time for the self-loop
 	// guard, so a redirected flow resolving back to this proxy (on loopback or
@@ -275,6 +286,18 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		return
 	}
 
+	// HTTPS through the interception CA likewise: every matched connection is
+	// decrypted, and the probability applies to each request on it instead of
+	// deciding once whether the whole connection is intercepted.
+	if matched && rule.HTTPStatus != 0 && proto == protoTLS && s.TLSInject != nil && identity != "" {
+		if early != nil {
+			_ = early.Close()
+			early = nil
+		}
+		s.serveIntercepted(ctx, log, client, dst, identity, prefix)
+		return
+	}
+
 	var action fault.Action
 	if matched {
 		action = rule.DecideAction()
@@ -318,62 +341,10 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		}
 	}
 
-	// L7: synthesize an HTTP status response without contacting the upstream.
-	// Cleartext HTTP never gets here (see serveHTTP). HTTPS is only decrypted
-	// when a CA is configured and the client offered an SNI to mint a
-	// certificate for; otherwise the connection falls through and is spliced
-	// untouched, which is the pre-CA behaviour.
-	if action.HTTPStatus != 0 {
-		switch {
-		case proto == protoTLS && s.TLSInject != nil && identity != "":
-			// Counted from the delivery callback, not after ServeForged returns: an
-			// HTTP/2 client keeps the connection pooled for the whole attack, so
-			// counting on return would report a working fault as "matched but never
-			// faulted" — the proxy's own silent-no-op signature.
-			err := s.TLSInject.ServeForged(ctx, client, prefix, tlsinject.Request{
-				Response: tlsinject.Response{
-					Status:  action.HTTPStatus,
-					Body:    action.HTTPBody,
-					Headers: action.HTTPHeaders,
-				},
-				HandshakeTimeout: s.peekTimeout(),
-				OnDelivered: func() {
-					markFaulted()
-					s.Metrics.HTTPInjected()
-					log.Info("injected https status", slog.Int("status", action.HTTPStatus))
-				},
-			})
-
-			var rejErr *tlsinject.RejectedError
-			if errors.As(err, &rejErr) {
-				// The client rejected our certificate, so the fault never applied —
-				// counted separately from faults, never as one. This is the signal
-				// that the CA is missing from the workload's truststore.
-				s.Metrics.TLSRejected()
-				log.Warn("client rejected the injected certificate; is the CA trusted by the target?",
-					slog.String("stage", rejErr.Stage),
-					slog.Any("err", err))
-				return
-			}
-			if err != nil {
-				// The connection was taken over and cannot be forwarded now, so it
-				// ends here either way. Count it so matched still reconciles with the
-				// outcome counters instead of silently losing a connection.
-				s.Metrics.Dropped()
-				if errors.Is(err, tlsinject.ErrNotDelivered) {
-					// Teardown while the connection was open: expected, not a failure.
-					log.Debug("interception ended without delivering a response", slog.Any("err", err))
-				} else {
-					log.Warn("failed to serve injected https response", slog.Any("err", err))
-				}
-				return
-			}
-			// Success is reported by OnDelivered above, which fires when the
-			// response is written rather than when the connection ends.
-			return
-		}
-	}
-
+	// An HTTP status rule never gets here on cleartext HTTP (serveHTTP) or on
+	// HTTPS with a CA (serveIntercepted). Without a CA, or without an SNI to
+	// mint a certificate for, HTTPS is spliced through untouched, which is the
+	// pre-CA behaviour.
 	s.forward(ctx, log, client, dst, prefix, nil, early)
 }
 
