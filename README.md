@@ -203,25 +203,30 @@ window is rejected at startup rather than failing every handshake later.
 
 **Forwarding a request that is not faulted** — the proxy opens its own TLS
 connection to the connection's original destination, with the request's host
-as SNI, and **verifies the dependency's certificate against the system roots**,
-or, where the machine has none (the extension images ship none), against
-Mozilla's root CAs built into the binary. A dependency whose certificate comes
-from a private CA, trusted only by the workload's own truststore, needs that CA
-given to the proxy too:
+as SNI, and **verifies the dependency's certificate** against the system roots,
+then Mozilla's root CAs built into the binary (the extension images ship no
+roots of their own), then any `--upstream-ca-file`; the first that verifies
+wins. A dependency whose certificate comes from a private CA, trusted only by
+the workload's own truststore, needs that CA given to the proxy too:
 
 ```bash
 transparent-proxy ... --upstream-ca-file /path/to/company-ca.pem
 ```
 
-These CAs are trusted **in addition to** the system (or built-in) roots, and the
+These CAs are trusted **in addition to** the system and built-in roots, and the
 dependency's hostname is still checked. Extensions pass a custom CA through
 `SSL_CERT_DIR` / `SSL_CERT_FILE` instead, which Go reads as system roots; the
 built-in roots are then still checked, so public dependencies keep verifying.
 For test environments, `--upstream-insecure-skip-verify` forwards without
-verifying the dependency at all; the proxy logs a warning when it is set. It
-never forwards to an endpoint it cannot verify: such a request gets a `502`
-and counts as `upstream_errors`, not as a fault. HTTP/2 is used towards the
-dependency when it offers it. A faulted response is fabricated, never a
+verifying the dependency at all; the proxy logs a warning when it is set.
+Unless that flag is set, the proxy never forwards to an endpoint it cannot
+verify: such a request gets a `502` and counts as `upstream_errors`, not as a
+fault. The `502` is the proxy's own: the TLS handshake to the dependency is
+aborted, so the dependency never sees the request. The proxy logs
+`forwarding an intercepted request failed` with the cause (e.g. `x509:
+certificate signed by unknown authority`). A `--upstream-ca-file` with the
+wrong CA is not rejected at startup; it behaves as if none were given. HTTP/2
+is used towards the dependency when it offers it. A faulted response is fabricated, never a
 modified real one.
 
 **Every matched connection is decrypted**, whatever the `probability`, since
@@ -260,6 +265,9 @@ make linux     # static linux amd64 + arm64 (deployment targets)
 make test      # go test -race ./...
 make run       # run locally with examples/faults.json
 ```
+
+`examples/https-lab/run.sh` runs HTTPS interception end to end in Docker, with
+private and public CAs.
 
 ## Releases
 
