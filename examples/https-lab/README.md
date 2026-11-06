@@ -1,0 +1,143 @@
+# HTTPS lab
+
+Exercises HTTPS response injection end to end, on any machine with Docker
+(macOS included: the proxy runs in a Linux container).
+
+- `upstream` — nginx on `https://upstream.test`, with a certificate from a
+  **private upstream CA**.
+- `client` — curl, trusting only the CA each case passes with `--cacert`.
+- `proxy` — this repo's binary, in the client's network namespace (as the
+  extension runs it in the target's), capturing its outbound `:443` with its own
+  iptables rules and faulting `upstream.test` with `503` at probability `0.5`.
+
+`gen-certs.sh` creates two CAs into `certs/` (git-ignored): the **interception
+CA** the proxy mints leaves with and the client trusts, and the **upstream CA**
+that signed the server's certificate, which only the proxy is given
+(`--upstream-ca-file`).
+
+`run.sh` runs it on first use; nothing is committed. The certificates are valid
+for 30 days, so regenerate them (and restart the lab, so nginx picks up the new
+server certificate) with:
+
+```bash
+rm -rf certs && ./gen-certs.sh && ./run.sh down
+```
+
+```bash
+./run.sh          # build the linux binary, start the lab, run every case
+./run.sh 2 5      # only some cases
+REQUESTS=100 ./run.sh 2
+./run.sh down     # remove the containers
+```
+
+Each case sends its requests over a single keep-alive connection, so the share
+of `503`s shows the probability is rolled per request.
+
+| case | setup | expected |
+| ---- | ----- | -------- |
+| 0 | no proxy | `200` trusting the upstream CA; `000` trusting only the interception CA |
+| 1 | no `--upstream-ca-file` | ~half `503`, the rest `502`; `upstream_errors` > 0 |
+| 2 | `--upstream-ca-file` | ~half `503`, the rest `200` |
+| 3 | `--upstream-insecure-skip-verify` | as case 2, plus the skip-verify warning |
+| 4 | client does not trust the interception CA | all `000`; `tls_intercept_rejected` > 0 |
+| 5 | client speaks HTTP/2 | `HTTP/2` to the client; forwarded requests reach nginx as `HTTP/2.0` |
+| 6 | `--upstream-ca-file` with a CA that did not sign nginx | as case 1 |
+| 7 | a public site (`PUBLIC_HOST`, default `example.com`), no flags; the proxy's system roots are alpine's, none, then only a private CA | ~half `503`, the rest `200`, in every variant |
+
+The proxy uses HTTP/2 towards the upstream whenever nginx offers it, so the
+forwarded requests of cases 2–3 reach it over HTTP/2 as well; case 5 adds
+HTTP/2 on the client side.
+
+## Running it by hand
+
+`./run.sh --manual` starts the lab **without a proxy and without testing**.
+Then, in one terminal, open a shell in the client's network namespace (where
+`./transparent-proxy` and `certs/` are in the working directory):
+
+```bash
+./run.sh shell
+```
+
+and run the proxy there. Ctrl-C stops it: it removes its iptables rules and
+logs its final metrics.
+
+```bash
+# forwarded requests verified against the private upstream CA -> 503 / 200
+./transparent-proxy --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
+  --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
+  --upstream-ca-file certs/upstream-ca.crt \
+  --fault-hosts upstream.test --fault-http-status 503 --fault-probability 0.5 \
+  --metrics-addr 127.0.0.1:9090
+
+# no upstream CA: the proxy cannot verify nginx -> 503 / 502 (upstream_errors)
+./transparent-proxy --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
+  --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
+  --fault-hosts upstream.test --fault-http-status 503 --fault-probability 0.5 \
+  --metrics-addr 127.0.0.1:9090
+
+# forwarded without verifying nginx -> 503 / 200, and a warning at startup
+./transparent-proxy --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
+  --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
+  --upstream-insecure-skip-verify \
+  --fault-hosts upstream.test --fault-http-status 503 --fault-probability 0.5 \
+  --metrics-addr 127.0.0.1:9090
+
+# the CA as one PEM stream on stdin, as the extension passes it
+cat certs/intercept-ca.crt certs/intercept-ca.key |
+  ./transparent-proxy --tls-ca-stdin --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
+    --upstream-ca-file certs/upstream-ca.crt \
+    --fault-hosts upstream.test --fault-http-status 503 --fault-probability 0.5
+```
+
+In another terminal, the client:
+
+```bash
+# one request, trusting the interception CA
+docker exec https-lab-client-1 curl -s --cacert /certs/intercept-ca.crt https://upstream.test/
+
+# see the certificate the proxy minted (issuer: HTTPS Lab Interception CA)
+docker exec https-lab-client-1 curl -sv -o /dev/null --cacert /certs/intercept-ca.crt https://upstream.test/ 2>&1 | grep -E 'subject:|issuer:|HTTP/'
+
+# 10 requests over one keep-alive connection: the probability is rolled per request
+docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/intercept-ca.crt -w '%{http_code} new_connection=%{num_connects}\n' -o /dev/null 'https://upstream.test/[1-10]'
+
+# the same over HTTP/2
+docker exec https-lab-client-1 curl -s --http2 --cacert /certs/intercept-ca.crt -w '%{http_code} %{http_version}\n' -o /dev/null 'https://upstream.test/[1-10]'
+
+# trusting only the real upstream CA: fails (exit 60) while the proxy runs, since it answers the handshake
+docker exec https-lab-client-1 curl -s --cacert /certs/upstream-ca.crt https://upstream.test/; echo "exit=$?"
+
+# not trusting the interception CA: fails and counts as tls_intercept_rejected
+docker exec https-lab-client-1 curl -s https://upstream.test/; echo "exit=$?"
+
+# the proxy's live metrics (loopback is never captured)
+docker exec https-lab-client-1 curl -s http://127.0.0.1:9090/
+
+# what the upstream received (protocol per request)
+docker logs --tail 10 https-lab-upstream-1
+```
+
+## Stopping the proxy
+
+The proxy shuts down cleanly on `SIGINT` or `SIGTERM`: it removes its iptables
+rules, so the client goes straight to nginx again, and logs its final metrics
+(`"proxy stopped"`).
+
+- In the shell where it runs: Ctrl-C.
+- From another terminal, when the shell is busy or detached:
+
+  ```bash
+  docker exec "$(docker ps -q --filter label=com.docker.compose.service=proxy)" pkill transparent-proxy
+  ```
+
+- A proxy started by `./run.sh` (container `https-lab-proxy`, e.g. after the
+  script was interrupted mid-case): `docker stop https-lab-proxy`.
+- The whole lab: `./run.sh down`. It kills the proxy rather than stopping it,
+  which is fine here: the iptables rules live in the client's network
+  namespace and go away with its container.
+
+If a proxy is killed rather than stopped (e.g. the shell's container removed
+with `docker rm -f`), its iptables rules stay behind and the next proxy's
+preflight refuses to start on top of them. Clear them from the shell with
+`./transparent-proxy --revert --intercept-cidrs 0.0.0.0/0 --intercept-ports 443`,
+or re-run `./run.sh --manual`, which does the same.
