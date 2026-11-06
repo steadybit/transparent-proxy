@@ -4,7 +4,12 @@
 package proxy
 
 import (
+	"crypto/x509"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"sync"
 	"testing"
 
 	"github.com/steadybit/transparent-proxy/internal/fault"
@@ -46,6 +51,71 @@ func TestServer_TLSInject_TrustedCAStillChecksTheHostname(t *testing.T) {
 	}
 	if s.UpstreamErrors != 1 {
 		t.Fatalf("upstream errors = %d, want 1", s.UpstreamErrors)
+	}
+}
+
+// TestServer_TLSInject_WrongTrustedCAIsRejected trusts a CA, but not the one
+// that signed the dependency's certificate: as with no trusted CA at all, the
+// request gets a 502 counted as an upstream error.
+func TestServer_TLSInject_WrongTrustedCAIsRejected(t *testing.T) {
+	_, otherCAPEM := newInterceptCA(t)
+	other := x509.NewCertPool()
+	if !other.AppendCertsFromPEM(otherCAPEM) {
+		t.Fatal("failed to add the other CA to the pool")
+	}
+	statuses, s := forwardOnce(t, upstreamHost, &Server{UpstreamTrustedCAs: other}, false)
+	if statuses[http.StatusBadGateway] != 1 {
+		t.Fatalf("statuses = %v, want one 502 for a dependency signed by another CA", statuses)
+	}
+	if s.UpstreamErrors != 1 || s.RequestsFaulted != 0 {
+		t.Fatalf("upstream errors / requests faulted = %d / %d, want 1 / 0", s.UpstreamErrors, s.RequestsFaulted)
+	}
+}
+
+// TestServer_TLSInject_ForwardsOverHTTP2WhenTheDependencyOffersIt checks the
+// proxy's own leg to the dependency: whatever the client speaks, forwarded
+// requests reach a dependency that offers HTTP/2 over HTTP/2.
+func TestServer_TLSInject_ForwardsOverHTTP2WhenTheDependencyOffersIt(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		http2 bool
+	}{
+		{name: "HTTP/1.1 client", http2: false},
+		{name: "HTTP/2 client", http2: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const requests = 5
+			var mu sync.Mutex
+			protos := map[string]int{}
+			upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				protos[r.Proto]++
+				mu.Unlock()
+				_, _ = io.WriteString(w, "real-response")
+			}))
+			upstream.EnableHTTP2 = true
+			upstream.StartTLS()
+			t.Cleanup(upstream.Close)
+
+			ca, caPEM := newInterceptCA(t)
+			proxyAddr := serveProxy(t, &Server{
+				Faults:             fault.NewEngine([]fault.Rule{statusRule(upstreamHost, 0, http.StatusServiceUnavailable)}),
+				TLSInject:          ca,
+				Metrics:            metrics.New(),
+				UpstreamTrustedCAs: certPool(upstream),
+			}, netip.MustParseAddrPort(upstream.Listener.Addr().String()))
+			client := newKeepAliveHTTPSClient(t, proxyAddr, upstream, caPEM, tc.http2)
+
+			statuses := client.sendGets(t, "https://"+upstreamHost+"/", requests)
+			if statuses[http.StatusOK] != requests {
+				t.Fatalf("statuses = %v, want %d 200s", statuses, requests)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if protos["HTTP/2.0"] != requests {
+				t.Fatalf("the dependency saw %v, want all %d requests over HTTP/2.0", protos, requests)
+			}
+		})
 	}
 }
 
