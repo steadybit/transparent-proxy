@@ -5,7 +5,6 @@ package proxy
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"io"
 	"log"
@@ -132,7 +131,8 @@ func (c *interceptedConn) upstreamFailed(w http.ResponseWriter, _ *http.Request,
 // upstreamTransport forwards an intercepted connection's requests to its
 // original destination dst, whatever the request's host, over the proxy's own
 // TLS connections: SNI is the request's host and the dependency's certificate
-// is verified, so the proxy never forwards to an impostor. HTTP/2 is used when
+// is verified (see upstreamTLSConfig), so the proxy never forwards to an
+// impostor. HTTP/2 is used when
 // the dependency offers it.
 func (s *Server) upstreamTransport(dst netip.AddrPort) *http.Transport {
 	return &http.Transport{
@@ -143,7 +143,7 @@ func (s *Server) upstreamTransport(dst netip.AddrPort) *http.Transport {
 			}
 			return conn, nil
 		},
-		TLSClientConfig:     &tls.Config{RootCAs: s.UpstreamRootCAs, MinVersion: tls.VersionTLS12},
+		TLSClientConfig:     s.upstreamTLSConfig(),
 		TLSHandshakeTimeout: s.peekTimeout(),
 		ForceAttemptHTTP2:   true,
 		MaxIdleConnsPerHost: 4,

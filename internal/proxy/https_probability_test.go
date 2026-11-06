@@ -45,9 +45,9 @@ func TestServer_TLSInject_ProbabilityAppliesPerRequestOnKeepAlive(t *testing.T) 
 			upstream, dst := startH2CapableTLSUpstream(t)
 			ca, caPEM := newInterceptCA(t)
 			proxyAddr := serveProxy(t, &Server{
-				Faults:          fault.NewEngine([]fault.Rule{statusRule(upstreamHost, probability, http.StatusServiceUnavailable)}),
-				TLSInject:       ca,
-				UpstreamRootCAs: certPool(upstream),
+				Faults:             fault.NewEngine([]fault.Rule{statusRule(upstreamHost, probability, http.StatusServiceUnavailable)}),
+				TLSInject:          ca,
+				UpstreamTrustedCAs: certPool(upstream),
 			}, dst)
 			client := newKeepAliveHTTPSClient(t, proxyAddr, upstream, caPEM, tc.http2)
 
@@ -140,10 +140,11 @@ func TestServer_TLSInject_ForwardingVerifiesTheDependency(t *testing.T) {
 	ca, caPEM := newInterceptCA(t)
 	m := metrics.New()
 	proxyAddr := serveProxy(t, &Server{
-		Faults:          fault.NewEngine([]fault.Rule{statusRule(upstreamHost, 0, http.StatusServiceUnavailable)}),
-		TLSInject:       ca,
-		Metrics:         m,
-		UpstreamRootCAs: x509.NewCertPool(), // trusts nothing
+		Faults:    fault.NewEngine([]fault.Rule{statusRule(upstreamHost, 0, http.StatusServiceUnavailable)}),
+		TLSInject: ca,
+		Metrics:   m,
+		// No trusted CAs of its own: the test upstream's certificate is in
+		// neither the system roots nor the built-in ones.
 	}, dst)
 	client := newKeepAliveHTTPSClient(t, proxyAddr, upstream, caPEM, false)
 

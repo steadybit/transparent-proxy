@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -78,6 +79,11 @@ func main() {
 		tlsCAKey   = flag.String("tls-ca-key", "", "PEM private key matching --tls-ca-cert")
 		tlsLeafTTL = flag.Duration("tls-leaf-validity", 0, "how long minted per-SNI certificates are valid (0 = built-in default; always clamped to the CA's own expiry)")
 		tlsCAStdin = flag.Bool("tls-ca-stdin", false, "read the interception CA (certificate and private key, one PEM stream) from stdin instead of from files")
+
+		// Verifying the real dependency when a request on an intercepted HTTPS
+		// connection is not faulted and is forwarded to it.
+		upstreamCAFile   = flag.String("upstream-ca-file", "", "PEM CA certificates trusted, in addition to the system roots, to verify the dependency when an intercepted HTTPS request is forwarded (dependencies with a private CA)")
+		upstreamInsecure = flag.Bool("upstream-insecure-skip-verify", false, "forward intercepted HTTPS requests without verifying the dependency's certificate (test environments only)")
 
 		// Single-rule fault flags — a convenience for orchestrators that inject
 		// one fault, avoiding a JSON --config file. Appended to any --config rules.
@@ -178,6 +184,17 @@ func main() {
 		srv.TLSInject = injector
 		logger.Info("HTTPS response injection enabled",
 			slog.Time("ca_not_after", injector.NotAfter()))
+	}
+
+	trusted, err := loadUpstreamCAs(*upstreamCAFile)
+	if err != nil {
+		logger.Error("invalid upstream CA file", slog.Any("err", err))
+		os.Exit(2)
+	}
+	srv.UpstreamTrustedCAs = trusted
+	srv.UpstreamInsecureSkipVerify = *upstreamInsecure
+	if *upstreamInsecure {
+		logger.Warn("forwarding intercepted HTTPS requests without verifying the dependency's certificate")
 	}
 
 	// Preflight: refuse to fight an existing mesh proxy. Ports default to the
@@ -317,6 +334,25 @@ func loadRules(path string) ([]fault.Rule, error) {
 // lifecycle judgement made here is refusing one that is already outside its
 // validity window, because it would otherwise fail every handshake with a far
 // less obvious error.
+// loadUpstreamCAs reads the CA certificates trusted, on top of the system
+// roots, to verify a dependency that has a private CA. An empty path means
+// none; a file without any certificate is an error rather than silently
+// trusting nothing extra.
+func loadUpstreamCAs(path string) (*x509.CertPool, error) {
+	if path == "" {
+		return nil, nil
+	}
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("no PEM certificate in %s", path)
+	}
+	return pool, nil
+}
+
 func loadInterceptCA(certPath, keyPath string, fromStdin bool) (*tlsinject.CA, error) {
 	var (
 		ca  *tlsinject.CA

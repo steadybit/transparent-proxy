@@ -83,10 +83,15 @@ type Server struct {
 	// spliced through untouched exactly as before.
 	TLSInject *tlsinject.CA
 
-	// UpstreamRootCAs verifies the real dependency's certificate when a request
-	// on an intercepted HTTPS connection is forwarded to it. Nil uses the
-	// system roots, or the roots built into the binary where there are none.
-	UpstreamRootCAs *x509.CertPool
+	// UpstreamTrustedCAs are trusted, in addition to the system roots (or the
+	// roots built into the binary where there are none), to verify the real
+	// dependency when a request on an intercepted HTTPS connection is
+	// forwarded to it: a dependency whose certificate comes from a private CA.
+	UpstreamTrustedCAs *x509.CertPool
+
+	// UpstreamInsecureSkipVerify forwards to the real dependency without
+	// verifying its certificate. For test environments only.
+	UpstreamInsecureSkipVerify bool
 
 	// listenPort and localAddrs are captured at Serve time for the self-loop
 	// guard, so a redirected flow resolving back to this proxy (on loopback or
