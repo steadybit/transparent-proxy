@@ -35,6 +35,13 @@ func (s *Server) serveIntercepted(ctx context.Context, log *slog.Logger, client 
 			if r.Out.URL.Host == "" {
 				r.Out.URL.Host = identity
 			}
+			// ReverseProxy strips these when Rewrite is set; a request that
+			// is not faulted must reach the dependency as the workload sent it.
+			for _, h := range forwardedHeaders {
+				if v, ok := r.In.Header[h]; ok {
+					r.Out.Header[h] = v
+				}
+			}
 		},
 		Transport:    upstream,
 		ErrorLog:     discardLog,
@@ -121,8 +128,14 @@ func (c *interceptedConn) serve(w http.ResponseWriter, r *http.Request) {
 
 // upstreamFailed answers a forwarded request whose dependency could not be
 // reached. A 502 is what a gateway would answer; the request is not a fault
-// the attack injected, so it is counted as an upstream error.
-func (c *interceptedConn) upstreamFailed(w http.ResponseWriter, _ *http.Request, err error) {
+// the attack injected, so it is counted as an upstream error. A request the
+// client gave up on (stream reset, timeout, disconnect) is neither: there is
+// no one left to answer.
+func (c *interceptedConn) upstreamFailed(w http.ResponseWriter, r *http.Request, err error) {
+	if r.Context().Err() != nil {
+		c.log.Debug("client cancelled a forwarded request", slog.Any("err", err))
+		return
+	}
 	c.s.Metrics.UpstreamError()
 	c.log.Warn("forwarding an intercepted request failed", slog.Any("err", err))
 	w.WriteHeader(http.StatusBadGateway)
@@ -150,6 +163,10 @@ func (s *Server) upstreamTransport(dst netip.AddrPort) *http.Transport {
 		IdleConnTimeout:     90 * time.Second,
 	}
 }
+
+// forwardedHeaders are the proxy headers the workload may have set, which
+// ReverseProxy would otherwise drop from a forwarded request.
+var forwardedHeaders = []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"}
 
 // discardLog silences net/http's own logging of client-side noise, which
 // would otherwise bypass the proxy's structured logger.

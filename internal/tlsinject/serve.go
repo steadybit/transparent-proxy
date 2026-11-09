@@ -180,8 +180,13 @@ func isCertError(err error) bool {
 // negotiated during the handshake above.
 func serveOne(tc *tls.Conn, handler http.Handler) error {
 	ln := newOneShotListener(tc)
+	var handlers sync.WaitGroup
 	srv := &http.Server{
-		Handler:           handler,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handlers.Add(1)
+			defer handlers.Done()
+			handler.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: readHeaderTimeout,
 		// A TLSConfig advertising h2 is what makes Serve install the stdlib's
 		// HTTP/2 handler. net/http then picks the protocol by type-asserting the
@@ -194,8 +199,17 @@ func serveOne(tc *tls.Conn, handler http.Handler) error {
 		// Completion is observed here rather than by wrapping the connection,
 		// which would hide its *tls.Conn type and silently downgrade h2 to h1.
 		ConnState: func(_ net.Conn, state http.ConnState) {
-			if state == http.StateClosed || state == http.StateHijacked {
+			switch state {
+			case http.StateClosed:
 				ln.finish()
+			case http.StateHijacked:
+				// The handler that took the connection over (a WebSocket tunnel
+				// after a 101) still uses it: returning now would have the caller
+				// close the connection under the tunnel.
+				go func() {
+					handlers.Wait()
+					ln.finish()
+				}()
 			}
 		},
 	}
