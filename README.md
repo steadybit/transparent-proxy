@@ -67,9 +67,10 @@ The hostname/SNI targeting is what makes **one** tool work for both internal
   splicing it, so faults apply per request on keep-alive connections (see
   [How probability applies](#how-probability-applies)).
 - **Interception path (opt-in):** only when a CA is supplied via
-  `--tls-ca-cert`/`--tls-ca-key` *and* a matching rule carries `httpStatus`, an
-  HTTPS connection is terminated and handled request by request: faulted
-  requests get a synthesized response, the others are forwarded. See
+  `--tls-ca-cert`/`--tls-ca-key` *and* a matching rule carries `httpStatus` or
+  `latency`, an HTTPS connection is terminated and handled request by request:
+  faulted requests get a synthesized response or are delayed, the others are
+  forwarded. See
   [HTTPS response injection](#https-response-injection). Without a CA the proxy
   never decrypts anything.
 
@@ -110,16 +111,17 @@ selectors match — an empty selector means "any".
 - `cidrs` — match the original destination IP (internal targeting).
 - `hosts` — match the TLS SNI, exact or subdomain (external targeting).
 - `latency` — Go duration string, added before the upstream connect (for
-  cleartext HTTP: before each affected request is forwarded).
+  cleartext HTTP, and HTTPS through the interception CA: before each affected
+  request is forwarded).
 - `abort` — reset (RST) the connection. On HTTPS through the interception CA,
   the request is aborted instead: its stream is reset on HTTP/2, and the
   connection closed (not reset) on HTTP/1.1.
 - `httpStatus` — synthesize this HTTP status (L7). Cleartext HTTP always; HTTPS
   only with an interception CA (see below).
 - `probability` — `[0,1]` chance to apply the fault (unset = always, `0` =
-  never), per request for cleartext HTTP and, for rules with an `httpStatus`,
-  for HTTPS through the interception CA; per connection otherwise (e.g. a
-  `latency` rule on HTTPS).
+  never), per request for cleartext HTTP and, for rules with an `httpStatus`
+  or a `latency`, for HTTPS through the interception CA; per connection
+  otherwise (e.g. an `abort`-only rule on HTTPS).
 
 ### How probability applies
 
@@ -138,8 +140,10 @@ can be checked against `probability`; the `connections_*` counters stay per
 connection.
 
 **HTTPS through the interception CA — per request** as well, for rules with an
-`httpStatus`: the connection is decrypted and each request rolled on its own
-(see [HTTPS response injection](#https-response-injection)).
+`httpStatus` or a `latency`: the connection is decrypted and each request
+rolled on its own (see [HTTPS response injection](#https-response-injection)).
+An `abort`-only rule is not worth decrypting for and resets the TCP connection
+instead.
 
 **Everything else — per connection.** TLS without an interception CA, and
 non-HTTP TCP, are rolled once when the connection opens, and every request on it shares that outcome. A keep-alive
@@ -158,7 +162,9 @@ Limits of the per-request path:
 
 By default the proxy never decrypts TLS: it reads the SNI in cleartext and
 splices the bytes through. Supplying a CA opts in to terminating **matched**
-HTTPS connections so an `httpStatus` fault can be synthesized inside TLS:
+HTTPS connections so an `httpStatus` fault can be synthesized inside TLS, and
+a `latency` fault can delay every request rather than only the first one on a
+connection:
 
 ```bash
 transparent-proxy \
@@ -250,7 +256,7 @@ splicing connections that are not faulted:
 **When it does not apply** — the connection is spliced through untouched:
 
 - no CA configured, or the client sent no SNI;
-- the rule carries no `httpStatus`.
+- the rule carries neither `httpStatus` nor `latency`.
 
 **When the client refuses** — if the workload does not trust the CA (or pins
 certificates) it either fails the handshake, or, under TLS 1.3, completes it and

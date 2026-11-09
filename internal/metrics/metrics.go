@@ -24,10 +24,10 @@ type Metrics struct {
 	ConnectionsAborted    atomic.Int64 // reset by an abort rule
 	ConnectionsDropped    atomic.Int64 // loop guard / peek failure / self-refusal
 	ConnectionsFaulted    atomic.Int64 // connections a fault was actually applied to (once each)
-	LatencyApplied        atomic.Int64 // connections (or cleartext HTTP requests) a latency fault delayed
+	LatencyApplied        atomic.Int64 // connections (or HTTP requests) a latency fault delayed
 	HTTPResponsesInjected atomic.Int64 // synthesized HTTP responses written
-	RequestsMatched       atomic.Int64 // cleartext HTTP requests that matched a rule
-	RequestsFaulted       atomic.Int64 // cleartext HTTP requests a fault was applied to
+	RequestsMatched       atomic.Int64 // HTTP requests that matched a rule
+	RequestsFaulted       atomic.Int64 // HTTP requests a fault was applied to
 	TLSInterceptRejected  atomic.Int64 // HTTPS interception rejected by the client (CA not trusted / pinning)
 	UpstreamErrors        atomic.Int64 // dial failures
 	BytesToUpstream       atomic.Int64
@@ -180,8 +180,8 @@ func (m *Metrics) Faulted() {
 	}
 }
 
-// LatencyInjected records a connection, or a cleartext HTTP request, a latency
-// fault delayed.
+// LatencyInjected records a connection, or an HTTP request, a latency fault
+// delayed.
 func (m *Metrics) LatencyInjected() {
 	if m != nil {
 		m.LatencyApplied.Add(1)

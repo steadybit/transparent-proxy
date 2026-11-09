@@ -30,13 +30,14 @@ type Rule struct {
 
 	// Probability in [0,1] gates whether this rule's fault is applied to a
 	// matching request (cleartext HTTP; HTTPS through the interception CA when
-	// HTTPStatus is set) or connection (everything else). A nil pointer means
+	// HTTPStatus or Latency is set) or connection (everything else). A nil pointer means
 	// unset → always (1.0); an explicit 0 means never; values are used as given
 	// otherwise.
 	Probability *float64
 
 	// Latency is added before the upstream connection is established,
-	// simulating a slow-to-connect dependency.
+	// simulating a slow-to-connect dependency. On HTTP, cleartext or through
+	// the interception CA, it is added before each request is forwarded.
 	Latency time.Duration
 
 	// Abort, when true, resets the connection (RST) instead of proxying it,
