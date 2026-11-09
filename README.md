@@ -67,10 +67,10 @@ The hostname/SNI targeting is what makes **one** tool work for both internal
   splicing it, so faults apply per request on keep-alive connections (see
   [How probability applies](#how-probability-applies)).
 - **Interception path (opt-in):** only when a CA is supplied via
-  `--tls-ca-cert`/`--tls-ca-key` *and* a matching rule carries `httpStatus` or
-  `latency`, an HTTPS connection is terminated and handled request by request:
-  faulted requests get a synthesized response or are delayed, the others are
-  forwarded. See
+  `--tls-ca-cert`/`--tls-ca-key` *and* a matching rule carries `httpStatus`, or
+  `latency` with `hosts`, an HTTPS connection is terminated and handled request
+  by request: faulted requests get a synthesized response or are delayed, the
+  others are forwarded. See
   [HTTPS response injection](#https-response-injection). Without a CA the proxy
   never decrypts anything.
 
@@ -110,9 +110,9 @@ selectors match — an empty selector means "any".
 
 - `cidrs` — match the original destination IP (internal targeting).
 - `hosts` — match the TLS SNI, exact or subdomain (external targeting).
-- `latency` — Go duration string, added before the upstream connect (for
-  cleartext HTTP, and HTTPS through the interception CA: before each affected
-  request is forwarded).
+- `latency` — Go duration string, added before the upstream connect (for a
+  rule with `hosts`, on cleartext HTTP and HTTPS through the interception CA:
+  before each affected request is forwarded).
 - `abort` — reset (RST) the connection. On HTTPS through the interception CA,
   the request is aborted instead: its stream is reset on HTTP/2, and the
   connection closed (not reset) on HTTP/1.1.
@@ -121,7 +121,8 @@ selectors match — an empty selector means "any".
 - `probability` — `[0,1]` chance to apply the fault (unset = always, `0` =
   never), per request for cleartext HTTP and, for rules with an `httpStatus`
   or a `latency`, for HTTPS through the interception CA; per connection
-  otherwise (e.g. an `abort`-only rule on HTTPS).
+  otherwise (e.g. an `abort`-only rule on HTTPS, or a `latency` rule without
+  `hosts`).
 
 ### How probability applies
 
@@ -146,7 +147,10 @@ An `abort`-only rule is not worth decrypting for and resets the TCP connection
 instead.
 
 **Everything else — per connection.** TLS without an interception CA, and
-non-HTTP TCP, are rolled once when the connection opens, and every request on it shares that outcome. A keep-alive
+non-HTTP TCP, are rolled once when the connection opens, and every request on it shares that outcome.
+So is any connection a rule with a `latency` but no `hosts` (and no
+`httpStatus`) matches: the proxy keeps it on the splice fast path and never
+reads it, whatever the protocol. A keep-alive
 client that wins the roll keeps the connection, so the observed failure rate
 of its requests can be far below `probability`.
 
@@ -253,10 +257,12 @@ splicing connections that are not faulted:
   `tls_intercept_rejected` although the CA is trusted. Capture only the HTTPS
   port, e.g. `--intercept-ports 443`, rather than every port.
 
-**When it does not apply** — the connection is spliced through untouched:
+**When it does not apply** — the connection is spliced through, not decrypted:
 
 - no CA configured, or the client sent no SNI;
-- the rule carries neither `httpStatus` nor `latency`.
+- the rule carries neither `httpStatus` nor `latency`;
+- the rule carries a `latency` but no `hosts` (and no `httpStatus`): the
+  connection is never read, so its latency applies once per connection.
 
 **When the client refuses** — if the workload does not trust the CA (or pins
 certificates) it either fails the handshake, or, under TLS 1.3, completes it and

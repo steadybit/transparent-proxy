@@ -84,7 +84,7 @@ func main() {
 
 		// Single-rule fault flags — a convenience for orchestrators that inject
 		// one fault, avoiding a JSON --config file. Appended to any --config rules.
-		faultLatency = flag.Duration("fault-latency", 0, "single fault: latency added before connecting upstream (per request on cleartext HTTP, and on HTTPS when --tls-ca-cert is set)")
+		faultLatency = flag.Duration("fault-latency", 0, "single fault: latency added before connecting upstream (per request with --fault-hosts: on cleartext HTTP, and on HTTPS when --tls-ca-cert is set)")
 		faultReset   = flag.Bool("fault-reset", false, "single fault: reset (RST) matching connections")
 		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
 		faultBody    = flag.String("fault-http-body", "", "single fault: injected HTTP response body (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
