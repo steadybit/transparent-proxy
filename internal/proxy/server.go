@@ -76,9 +76,9 @@ type Server struct {
 	// ConnectionsMatched under load is the canonical silent-no-op signal.
 	Metrics *metrics.Metrics
 
-	// TLSInject, when non-nil, enables HTTPS response injection: a matched TLS
-	// connection carrying an L7 status fault is terminated with a certificate
-	// minted for its SNI, and the synthesized response is written inside TLS.
+	// TLSInject, when non-nil, enables HTTPS interception: a matched TLS
+	// connection with a status or latency fault is terminated with a
+	// certificate minted for its SNI, so the fault applies per request.
 	// Nil (the default) means TLS is never decrypted — HTTPS connections are
 	// spliced through untouched exactly as before.
 	TLSInject *tlsinject.CA
@@ -285,7 +285,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 
 	// HTTPS through the interception CA likewise: rolling per request means
 	// decrypting every matched connection, faulted or not.
-	if matched && rule.HTTPStatus != 0 && proto == protoTLS && s.TLSInject != nil && identity != "" {
+	if matched && worthDecrypting(rule) && proto == protoTLS && s.TLSInject != nil && identity != "" {
 		if early != nil {
 			_ = early.Close()
 			early = nil
@@ -338,8 +338,17 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 	}
 
 	// HTTPS without a CA, or without an SNI to mint a certificate for, cannot
-	// be decrypted and is spliced through even with an HTTP status rule.
+	// be decrypted and is spliced through even with an HTTP status rule; its
+	// latency is rolled once for the whole connection.
 	s.forward(ctx, log, client, dst, prefix, nil, early)
+}
+
+// worthDecrypting reports whether a rule's fault needs the requests inside TLS:
+// a status replaces a response and a latency delays each request. An
+// abort-only rule resets the TCP connection, which needs no decryption, so
+// it is not worth the wider impact of decrypting every matched connection.
+func worthDecrypting(rule fault.Rule) bool {
+	return rule.HTTPStatus != 0 || rule.Latency > 0
 }
 
 // forward splices the connection through to the upstream — the one given, or a
