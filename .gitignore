@@ -11,3 +11,6 @@ coverage.*
 .idea/
 .vscode/
 .DS_Store
+
+# Local notes
+/ISSUES.md
