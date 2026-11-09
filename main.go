@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -39,6 +40,11 @@ import (
 	"github.com/steadybit/transparent-proxy/internal/proxy"
 	"github.com/steadybit/transparent-proxy/internal/supervisor"
 	"github.com/steadybit/transparent-proxy/internal/tlsinject"
+
+	// Mozilla's root CAs, used only where the machine has none: the extension
+	// images, whose filesystem the proxy runs in, ship none, and every
+	// forwarded HTTPS request would get a 502.
+	_ "golang.org/x/crypto/x509roots/fallback"
 )
 
 func main() {
@@ -73,13 +79,16 @@ func main() {
 		tlsLeafTTL = flag.Duration("tls-leaf-validity", 0, "how long minted per-SNI certificates are valid (0 = built-in default; always clamped to the CA's own expiry)")
 		tlsCAStdin = flag.Bool("tls-ca-stdin", false, "read the interception CA (certificate and private key, one PEM stream) from stdin instead of from files")
 
+		upstreamCAFile   = flag.String("upstream-ca-file", "", "PEM CA certificates trusted, in addition to the system roots, to verify the dependency when an intercepted HTTPS request is forwarded (dependencies with a private CA)")
+		upstreamInsecure = flag.Bool("upstream-insecure-skip-verify", false, "forward intercepted HTTPS requests without verifying the dependency's certificate (test environments only)")
+
 		// Single-rule fault flags — a convenience for orchestrators that inject
 		// one fault, avoiding a JSON --config file. Appended to any --config rules.
 		faultLatency = flag.Duration("fault-latency", 0, "single fault: latency added before connecting upstream")
 		faultReset   = flag.Bool("fault-reset", false, "single fault: reset (RST) matching connections")
 		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
 		faultBody    = flag.String("fault-http-body", "", "single fault: injected HTTP response body (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
-		faultProb    = flag.Float64("fault-probability", 1, "single fault: probability [0,1] to apply the fault, per request for cleartext HTTP and per connection otherwise (default 1 = always, 0 = never)")
+		faultProb    = flag.Float64("fault-probability", 1, "single fault: probability [0,1] to apply the fault, per request for cleartext HTTP and, for a fault with an HTTP status, HTTPS through the interception CA; per connection otherwise (default 1 = always, 0 = never)")
 		faultHosts   = flag.String("fault-hosts", "", "single fault: comma-separated host selectors (SNI/Host)")
 		faultCIDRs   = flag.String("fault-cidrs", "", "single fault: comma-separated CIDR selectors")
 	)
@@ -172,6 +181,17 @@ func main() {
 		srv.TLSInject = injector
 		logger.Info("HTTPS response injection enabled",
 			slog.Time("ca_not_after", injector.NotAfter()))
+	}
+
+	trusted, err := loadUpstreamCAs(*upstreamCAFile)
+	if err != nil {
+		logger.Error("invalid upstream CA file", slog.Any("err", err))
+		os.Exit(2)
+	}
+	srv.UpstreamTrustedCAs = trusted
+	srv.UpstreamInsecureSkipVerify = *upstreamInsecure
+	if *upstreamInsecure {
+		logger.Warn("forwarding intercepted HTTPS requests without verifying the dependency's certificate")
 	}
 
 	// Preflight: refuse to fight an existing mesh proxy. Ports default to the
@@ -301,6 +321,23 @@ func loadRules(path string) ([]fault.Rule, error) {
 		return nil, nil
 	}
 	return config.Load(path)
+}
+
+// loadUpstreamCAs rejects a file without any certificate rather than silently
+// trusting nothing extra.
+func loadUpstreamCAs(path string) (*x509.CertPool, error) {
+	if path == "" {
+		return nil, nil
+	}
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("no PEM certificate in %s", path)
+	}
+	return pool, nil
 }
 
 // loadInterceptCA loads the optional HTTPS-interception CA. Returning (nil, nil)

@@ -29,9 +29,10 @@ type Rule struct {
 	Hosts []string
 
 	// Probability in [0,1] gates whether this rule's fault is applied to a
-	// matching request (cleartext HTTP) or connection (everything else). A nil
-	// pointer means unset → always (1.0); an explicit 0 means never; values are
-	// used as given otherwise.
+	// matching request (cleartext HTTP; HTTPS through the interception CA when
+	// HTTPStatus is set) or connection (everything else). A nil pointer means
+	// unset → always (1.0); an explicit 0 means never; values are used as given
+	// otherwise.
 	Probability *float64
 
 	// Latency is added before the upstream connection is established,
@@ -39,7 +40,9 @@ type Rule struct {
 	Latency time.Duration
 
 	// Abort, when true, resets the connection (RST) instead of proxying it,
-	// simulating a refused/flaky dependency.
+	// simulating a refused/flaky dependency. On HTTPS through the interception
+	// CA it aborts the request instead: the stream is reset on HTTP/2, and the
+	// connection closed on HTTP/1.1.
 	Abort bool
 
 	// HTTPStatus, if non-zero, makes the proxy synthesize an HTTP response with
