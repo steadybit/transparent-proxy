@@ -43,6 +43,8 @@ of `503`s shows the probability is rolled per request.
 | 5 | client speaks HTTP/2 | `HTTP/2` to the client; forwarded requests reach nginx as `HTTP/2.0` |
 | 6 | `--upstream-ca-file` with a CA that did not sign nginx | as case 1 |
 | 7 | a public site (`PUBLIC_HOST`, default `example.com`), no flags; the proxy's system roots are alpine's, none, then only a private CA | ~half `503`, the rest `200`, in every variant |
+| 8 | `--fault-latency 1s`, no `--fault-http-status` | on one connection, all `200`, ~half after ~1s, the rest at once |
+| 9 | `--fault-latency 1s --fault-http-status 503` | on one connection, ~half `503` after ~1s, the rest `200` at once |
 
 The proxy uses HTTP/2 towards the upstream whenever nginx offers it, so the
 forwarded requests of cases 2–3 reach it over HTTP/2 as well; case 5 adds
@@ -82,6 +84,22 @@ logs its final metrics.
   --fault-hosts upstream.test --fault-http-status 503 --fault-probability 0.5 \
   --metrics-addr 127.0.0.1:9090
 
+# delay only, no httpStatus: decrypted like a status, rolled per request;
+# a selected request is forwarded after 1s, the others at once -> all 200
+./transparent-proxy --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
+  --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
+  --upstream-ca-file certs/upstream-ca.crt \
+  --fault-hosts upstream.test --fault-latency 1s --fault-probability 0.5 \
+  --metrics-addr 127.0.0.1:9090
+
+# delay and a status: decrypted, rolled per request; a selected request gets the
+# 503 after 1s, the others are forwarded at once -> 503 after 1s / 200
+./transparent-proxy --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
+  --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
+  --upstream-ca-file certs/upstream-ca.crt \
+  --fault-hosts upstream.test --fault-latency 1s --fault-http-status 503 --fault-probability 0.5 \
+  --metrics-addr 127.0.0.1:9090
+
 # the CA as one PEM stream on stdin, as the extension passes it
 cat certs/intercept-ca.crt certs/intercept-ca.key |
   ./transparent-proxy --tls-ca-stdin --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
@@ -104,7 +122,15 @@ docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/intercept-ca.cr
 # the same over HTTP/2
 docker exec https-lab-client-1 curl -s --http2 --cacert /certs/intercept-ca.crt -w '%{http_code} %{http_version}\n' -o /dev/null 'https://upstream.test/[1-10]'
 
-# trusting only the real upstream CA: fails (exit 60) while the proxy runs, since it answers the handshake
+# delay only: 10 requests over one keep-alive connection, each a 200 after 1s
+# or at once
+docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/intercept-ca.crt -w '%{http_code} %{time_total}s new_connection=%{num_connects}\n' -o /dev/null 'https://upstream.test/[1-10]'
+
+# delay and a status: 10 requests over one keep-alive connection, each a 503
+# after 1s or a 200 at once
+docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/intercept-ca.crt -w '%{http_code} %{time_total}s new_connection=%{num_connects}\n' -o /dev/null 'https://upstream.test/[1-10]'
+
+# trusting only the real upstream CA: fails (exit 60) while a proxy with an httpStatus or a latency runs, since it answers the handshake
 docker exec https-lab-client-1 curl -s --cacert /certs/upstream-ca.crt https://upstream.test/; echo "exit=$?"
 
 # not trusting the interception CA: fails and counts as tls_intercept_rejected

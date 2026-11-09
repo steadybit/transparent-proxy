@@ -16,6 +16,7 @@ cd "$(dirname "$0")"
 # Cases faulting another host override both (bash locals are dynamically scoped).
 URL=https://upstream.test/
 FAULT_HOST=upstream.test
+FAULT=(--fault-http-status 503) # the fault besides the host and probability
 PUBLIC_HOST=${PUBLIC_HOST:-example.com}
 PROXY_ENV=() # -e flags for the proxy's container
 REQUESTS=${REQUESTS:-20}
@@ -53,7 +54,7 @@ start_proxy() {
   revert_leftovers
   dc run -d -T --name "$PROXY" ${PROXY_ENV[@]+"${PROXY_ENV[@]}"} proxy ./transparent-proxy "${CAPTURE[@]}" \
     --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
-    --fault-hosts "$FAULT_HOST" --fault-http-status 503 --fault-probability 0.5 \
+    --fault-hosts "$FAULT_HOST" ${FAULT[@]+"${FAULT[@]}"} --fault-probability 0.5 \
     "$@" >/dev/null 2>&1
   for _ in $(seq 50); do
     if docker exec "$PROXY" iptables -t nat -S 2>/dev/null | grep -q SB_TP_REDIR; then return; fi
@@ -74,28 +75,43 @@ stop_proxy() {
   local final
   final=$(grep '"proxy stopped"' <<<"$logs" || true)
   printf '  proxy metrics:'
-  for k in requests_matched requests_faulted upstream_errors tls_intercept_rejected; do
+  for k in requests_matched requests_faulted latency_applied upstream_errors tls_intercept_rejected; do
     printf ' %s' "$(grep -oE "\"$k\":[0-9]+" <<<"$final" | head -1 | tr -d '"')"
   done
   echo
   grep -E '"level":"WARN"' <<<"$logs" | grep -oE '"msg":"[^"]*"' | sort | uniq -c | sed 's/^/  warn: /' || true
 }
 
-# requests <curl flags...>: sends $REQUESTS requests over ONE curl invocation, so
-# they share a keep-alive connection, and tallies the status codes. curl speaks
-# HTTP/1.1 unless the case asks for --http2.
-requests() {
-  local args=()
+# curl_batch <write-out> <curl flags...>: sends $REQUESTS requests over ONE curl
+# invocation, so they share a keep-alive connection, and prints <write-out> per
+# response (nothing when curl got none). curl speaks HTTP/1.1 unless the case
+# asks for --http2.
+curl_batch() {
+  local fmt=$1 args=() out err
+  shift
   for _ in $(seq "$REQUESTS"); do args+=(-o /dev/null "$URL"); done
-  local out err
   err=$(mktemp)
-  out=$(dc exec -T client curl -sS -w '%{http_code} HTTP/%{http_version}\n' --http1.1 "$@" "${args[@]}" 2>"$err" || true)
+  out=$(dc exec -T client curl -sS -w "$fmt\n" --http1.1 "$@" "${args[@]}" 2>"$err" || true)
   if [[ -n $out ]]; then
-    sort <<<"$out" | uniq -c | sed 's/^/  /'
+    echo "$out"
   else
-    echo "  no response from curl: $(sort -u "$err" | head -3)"
+    echo "  no response from curl: $(sort -u "$err" | head -3)" >&2
   fi
   rm -f "$err"
+}
+
+# requests <curl flags...>: tallies the status codes of a curl_batch.
+requests() {
+  curl_batch '%{http_code} HTTP/%{http_version}' "$@" | sort | uniq -c | sed 's/^/  /'
+}
+
+# timed_requests <curl flags...>: tallies the status codes of a curl_batch by
+# whether each response took the 1s delay, and counts the connections opened.
+timed_requests() {
+  curl_batch '%{http_code} %{time_total} %{num_connects}' "$@" |
+    awk '{ print $1, ($2 >= 0.9 ? "after ~1s" : "at once"); conns += $3 }
+         END { if (NR) print "connections opened: " conns }' |
+    sort | uniq -c | sed 's/^/  /'
 }
 
 upstream_log() { dc logs --no-log-prefix upstream 2>/dev/null; }
@@ -185,6 +201,24 @@ case_7() {
   public_requests "c. a private CA as the only system root, as extensions mount one"
 }
 
+case_8() {
+  local FAULT=(--fault-latency 1s)
+  echo "== 8. delay only, no httpStatus (expect decrypted, rolled per request on one connection:"
+  echo "      all 200, ~half after ~1s, the rest at once)"
+  start_proxy --upstream-ca-file certs/upstream-ca.crt
+  timed_requests --cacert /certs/intercept-ca.crt
+  stop_proxy
+}
+
+case_9() {
+  local FAULT=(--fault-latency 1s --fault-http-status 503)
+  echo "== 9. delay and a status (expect decrypted, rolled per request on one connection:"
+  echo "      ~half 503 after ~1s, the rest 200 at once)"
+  start_proxy --upstream-ca-file certs/upstream-ca.crt
+  timed_requests --cacert /certs/intercept-ca.crt
+  stop_proxy
+}
+
 print_manual() {
   cat <<'EOF2'
 The lab is up, without a proxy. In one terminal open a shell in the client's
@@ -215,6 +249,22 @@ its final metrics). It faults half the requests to upstream.test with 503:
     --fault-hosts upstream.test --fault-http-status 503 --fault-probability 0.5 \
     --metrics-addr 127.0.0.1:9090
 
+  # delay only, no httpStatus: decrypted like a status, rolled per request;
+  # a selected request is forwarded after 1s, the others at once -> all 200
+  ./transparent-proxy --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
+    --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
+    --upstream-ca-file certs/upstream-ca.crt \
+    --fault-hosts upstream.test --fault-latency 1s --fault-probability 0.5 \
+    --metrics-addr 127.0.0.1:9090
+
+  # delay and a status: decrypted, rolled per request; a selected request gets the
+  # 503 after 1s, the others are forwarded at once -> 503 after 1s / 200
+  ./transparent-proxy --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
+    --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
+    --upstream-ca-file certs/upstream-ca.crt \
+    --fault-hosts upstream.test --fault-latency 1s --fault-http-status 503 --fault-probability 0.5 \
+    --metrics-addr 127.0.0.1:9090
+
   # the CA as one PEM stream on stdin, as the extension passes it:
   cat certs/intercept-ca.crt certs/intercept-ca.key | ./transparent-proxy --tls-ca-stdin ...
 
@@ -232,7 +282,15 @@ In another terminal, the client:
   # the same over HTTP/2
   docker exec https-lab-client-1 curl -s --http2 --cacert /certs/intercept-ca.crt -w '%{http_code} %{http_version}\n' -o /dev/null 'https://upstream.test/[1-10]'
 
-  # trusting only the real upstream CA: fails (exit 60) while the proxy runs, since it answers the handshake
+  # delay only: 10 requests over one keep-alive connection, each a 200 after 1s
+  # or at once
+  docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/intercept-ca.crt -w '%{http_code} %{time_total}s new_connection=%{num_connects}\n' -o /dev/null 'https://upstream.test/[1-10]'
+
+  # delay and a status: 10 requests over one keep-alive connection, each a 503
+  # after 1s or a 200 at once
+  docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/intercept-ca.crt -w '%{http_code} %{time_total}s new_connection=%{num_connects}\n' -o /dev/null 'https://upstream.test/[1-10]'
+
+  # trusting only the real upstream CA: fails (exit 60) while a proxy with an httpStatus or a latency runs, since it answers the handshake
   docker exec https-lab-client-1 curl -s --cacert /certs/upstream-ca.crt https://upstream.test/; echo "exit=$?"
 
   # not trusting the interception CA: fails and counts as tls_intercept_rejected
@@ -263,7 +321,7 @@ esac
 
 setup
 cases=("$@")
-[[ ${#cases[@]} -gt 0 ]] || cases=(0 1 2 3 4 5 6 7)
+[[ ${#cases[@]} -gt 0 ]] || cases=(0 1 2 3 4 5 6 7 8 9)
 for c in "${cases[@]}"; do
   echo
   "case_$c"
