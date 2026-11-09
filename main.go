@@ -91,7 +91,7 @@ func main() {
 		faultReset   = flag.Bool("fault-reset", false, "single fault: reset (RST) matching connections")
 		faultStatus  = flag.Int("fault-http-status", 0, "single fault: injected HTTP status (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
 		faultBody    = flag.String("fault-http-body", "", "single fault: injected HTTP response body (L7; cleartext HTTP, plus HTTPS when --tls-ca-cert is set)")
-		faultProb    = flag.Float64("fault-probability", 1, "single fault: probability [0,1] to apply the fault, per request for cleartext HTTP and HTTPS through the interception CA, per connection otherwise (default 1 = always, 0 = never)")
+		faultProb    = flag.Float64("fault-probability", 1, "single fault: probability [0,1] to apply the fault, per request for cleartext HTTP and, for a fault with an HTTP status, HTTPS through the interception CA; per connection otherwise (default 1 = always, 0 = never)")
 		faultHosts   = flag.String("fault-hosts", "", "single fault: comma-separated host selectors (SNI/Host)")
 		faultCIDRs   = flag.String("fault-cidrs", "", "single fault: comma-separated CIDR selectors")
 	)
@@ -326,14 +326,6 @@ func loadRules(path string) ([]fault.Rule, error) {
 	return config.Load(path)
 }
 
-// loadInterceptCA loads the optional HTTPS-interception CA. Returning (nil, nil)
-// means the feature is off and TLS is never decrypted.
-//
-// The customer owns this CA — they generate it, choose how long it lives, and
-// install it in the truststores of the workloads they want to fault. The only
-// lifecycle judgement made here is refusing one that is already outside its
-// validity window, because it would otherwise fail every handshake with a far
-// less obvious error.
 // loadUpstreamCAs reads the CA certificates trusted, on top of the system
 // roots, to verify a dependency that has a private CA. An empty path means
 // none; a file without any certificate is an error rather than silently
@@ -353,6 +345,14 @@ func loadUpstreamCAs(path string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// loadInterceptCA loads the optional HTTPS-interception CA. Returning (nil, nil)
+// means the feature is off and TLS is never decrypted.
+//
+// The customer owns this CA — they generate it, choose how long it lives, and
+// install it in the truststores of the workloads they want to fault. The only
+// lifecycle judgement made here is refusing one that is already outside its
+// validity window, because it would otherwise fail every handshake with a far
+// less obvious error.
 func loadInterceptCA(certPath, keyPath string, fromStdin bool) (*tlsinject.CA, error) {
 	var (
 		ca  *tlsinject.CA

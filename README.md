@@ -111,12 +111,15 @@ selectors match — an empty selector means "any".
 - `hosts` — match the TLS SNI, exact or subdomain (external targeting).
 - `latency` — Go duration string, added before the upstream connect (for
   cleartext HTTP: before each affected request is forwarded).
-- `abort` — reset (RST) the connection.
+- `abort` — reset (RST) the connection. On HTTPS through the interception CA,
+  the request is aborted instead: its stream is reset on HTTP/2, and the
+  connection closed (not reset) on HTTP/1.1.
 - `httpStatus` — synthesize this HTTP status (L7). Cleartext HTTP always; HTTPS
   only with an interception CA (see below).
 - `probability` — `[0,1]` chance to apply the fault (unset = always, `0` =
-  never), per request for cleartext HTTP and for HTTPS through the interception
-  CA, per connection otherwise.
+  never), per request for cleartext HTTP and, for rules with an `httpStatus`,
+  for HTTPS through the interception CA; per connection otherwise (e.g. a
+  `latency` rule on HTTPS).
 
 ### How probability applies
 
@@ -237,7 +240,12 @@ splicing connections that are not faulted:
   its requests to the matched hostnames, not only the faulted share;
 - a dependency that requires **mutual TLS** cannot be reached through the
   proxy: it forwards without the workload's client certificate, so requests
-  that are not faulted get a `502`. Do not target such dependencies.
+  that are not faulted get a `502`. Do not target such dependencies;
+- **all TLS to the matched hostnames is served as HTTP**, so a non-HTTP
+  protocol over TLS (IMAPS, LDAPS, Kafka, a database) to the same hostname on
+  a captured port fails on every connection, and counts as
+  `tls_intercept_rejected` although the CA is trusted. Capture only the HTTPS
+  port, e.g. `--intercept-ports 443`, rather than every port.
 
 **When it does not apply** — the connection is spliced through untouched:
 
