@@ -26,7 +26,7 @@ rm -rf certs && ./gen-certs.sh && ./run.sh down
 ```bash
 ./run.sh          # build the linux binary, start the lab, run every case
 ./run.sh 2 5      # only some cases
-REQUESTS=100 ./run.sh 2
+./run.sh -n 100 2  # 100 requests per case instead of 20 (or REQUESTS=100)
 ./run.sh down     # remove the containers
 ```
 

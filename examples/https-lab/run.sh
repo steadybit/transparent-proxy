@@ -5,6 +5,7 @@
 #
 #   ./run.sh            all cases
 #   ./run.sh 2 5        only cases 2 and 5
+#   ./run.sh -n 100 2   100 requests per batch instead of 20 (or REQUESTS=100)
 #   ./run.sh --manual   start the lab without testing, and print the
 #                       ./transparent-proxy commands and curls to run by hand
 #   ./run.sh shell      a shell in the client's network namespace, to run
@@ -319,8 +320,21 @@ case ${1:-} in
     ;;
 esac
 
+cases=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -n)
+      [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || { echo "-n needs a positive number of requests" >&2; exit 2; }
+      REQUESTS=$2
+      shift 2
+      ;;
+    *)
+      cases+=("$1")
+      shift
+      ;;
+  esac
+done
 setup
-cases=("$@")
 [[ ${#cases[@]} -gt 0 ]] || cases=(0 1 2 3 4 5 6 7 8 9)
 for c in "${cases[@]}"; do
   echo
