@@ -40,6 +40,10 @@ they match, otherwise a yellow `✗` per mismatch, with what it got. "About half
 allows 3 standard deviations (4 to 16 of 20), so a working proxy misses it about
 0.3% of the time. `run.sh` exits 1 when any case is not as expected.
 
+After every proxy stops, each case also checks it left nothing behind: no
+`SB_TP` iptables rules in the client's network namespace, and `upstream.test`
+answering the client directly again, `200` over both HTTP and HTTPS.
+
 | case | setup | expected |
 | ---- | ----- | -------- |
 | 0 | no proxy | `200` trusting the upstream CA; `000` trusting only the interception CA |

@@ -72,11 +72,18 @@ start_proxy() {
 
 # stop_proxy: stops the proxy (it tears its rules down) and prints its counters
 # and any warnings it logged, keeping them in METRICS and WARNS for the checks.
+# Then checks the proxy left nothing behind: no capture rules, and the
+# dependency answers the client directly again on both ports.
 stop_proxy() {
   docker stop -t 10 "$PROXY" >/dev/null
-  local logs
+  local logs left direct
   logs=$(docker logs "$PROXY" 2>&1)
   docker rm "$PROXY" >/dev/null
+  left=$(dc run --rm -T proxy sh -c 'for t in nat mangle filter raw; do iptables -t $t -S; done' 2>/dev/null | grep -c SB_TP || true)
+  direct="$(dc exec -T client curl -s -o /dev/null -m 5 -w '%{http_code}' http://upstream.test/ || true) $(dc exec -T client curl -s -o /dev/null -m 5 -w '%{http_code}' --cacert /certs/upstream-ca.crt https://upstream.test/ || true)"
+  echo "  after stop: capture rules left $left, direct http/https $direct"
+  expect "capture rules left after stop" "$left" 0
+  expect "direct http/https responses after stop" "$direct" "200 200"
   METRICS=$(grep '"proxy stopped"' <<<"$logs" || true)
   printf '  proxy metrics:'
   for k in requests_matched requests_faulted latency_applied upstream_errors tls_intercept_rejected; do
@@ -262,9 +269,10 @@ case_6() {
   before=$(upstream_log | wc -l)
   start_proxy --upstream-ca-file certs/upstream-ca.crt
   requests --http2 --cacert /certs/intercept-ca.crt
-  stop_proxy
+  # read nginx's log before stop_proxy, whose cleanup check sends requests of its own
   sleep 1
   upstream_protocols "$before"
+  stop_proxy
   expect_200s
   expect_all "responses over HTTP/2" '$2 == "HTTP/2"'
   expect "forwarded requests nginx saw" "$(grep -c . <<<"$UPSTREAM")" "$(count '$1 == 200')"
