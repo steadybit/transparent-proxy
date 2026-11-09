@@ -19,12 +19,8 @@ import (
 	"github.com/steadybit/transparent-proxy/internal/metrics"
 )
 
-// TestServer_TLSInject_ProbabilityAppliesPerRequestOnKeepAlive is the HTTPS
-// twin of TestServer_ProbabilityAppliesPerRequestOnKeepAlive: a keep-alive
-// client goes through the proxy with an interception CA and a 50% status
-// fault, and roughly half of its requests must be faulted. Rolled once per
-// connection, an HTTP/2 client gets all or nothing, and an HTTP/1.1 client
-// ends up on the first connection that won the roll.
+// Rolled once per connection, an HTTP/2 client gets all or nothing, and an
+// HTTP/1.1 client ends up on the first connection that won the roll.
 func TestServer_TLSInject_ProbabilityAppliesPerRequestOnKeepAlive(t *testing.T) {
 	const (
 		requests    = 1000
@@ -80,9 +76,8 @@ func startH2CapableTLSUpstream(t *testing.T) (*httptest.Server, netip.AddrPort) 
 	return srv, netip.MustParseAddrPort(srv.Listener.Addr().String())
 }
 
-// newKeepAliveHTTPSClient is newKeepAliveClient for HTTPS: it presents
-// upstreamHost as the SNI, trusts both the real upstream and the interception
-// CA, and speaks HTTP/2 when asked to.
+// newKeepAliveHTTPSClient trusts both the real upstream and the interception
+// CA, so it works whether its connection is spliced or intercepted.
 func newKeepAliveHTTPSClient(t *testing.T, proxyAddr netip.AddrPort, upstream *httptest.Server, caPEM []byte, http2 bool) *keepAliveClient {
 	t.Helper()
 	pool := x509.NewCertPool()
@@ -106,7 +101,6 @@ func newKeepAliveHTTPSClient(t *testing.T, proxyAddr netip.AddrPort, upstream *h
 	return c
 }
 
-// sendGetsByProto is sendGets that also counts the protocol of every response.
 func (c *keepAliveClient) sendGetsByProto(t *testing.T, url string, n int) (statuses map[int]int, protos map[string]int) {
 	t.Helper()
 	statuses, protos = map[int]int{}, map[string]int{}
@@ -131,10 +125,8 @@ func certPool(upstream *httptest.Server) *x509.CertPool {
 	return pool
 }
 
-// TestServer_TLSInject_ForwardingVerifiesTheDependency forwards a request that
-// was not faulted to an upstream whose certificate the proxy does not trust.
-// The proxy must refuse rather than forward to a possible impostor: the client
-// gets a 502, and it is counted as an upstream error, not as a fault.
+// An untrusted dependency may be an impostor: the proxy answers 502, counted as
+// an upstream error, not as a fault.
 func TestServer_TLSInject_ForwardingVerifiesTheDependency(t *testing.T) {
 	upstream, dst := startH2CapableTLSUpstream(t)
 	ca, caPEM := newInterceptCA(t)

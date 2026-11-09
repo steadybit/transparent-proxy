@@ -41,10 +41,9 @@ import (
 	"github.com/steadybit/transparent-proxy/internal/supervisor"
 	"github.com/steadybit/transparent-proxy/internal/tlsinject"
 
-	// Mozilla's root CAs, used only where the machine has none. The proxy runs
-	// inside the extension's filesystem, and the extension images ship no root
-	// CAs, so without these a request forwarded on an intercepted HTTPS
-	// connection could not verify its dependency and would get a 502.
+	// Mozilla's root CAs, used only where the machine has none: the extension
+	// images, whose filesystem the proxy runs in, ship none, and every
+	// forwarded HTTPS request would get a 502.
 	_ "golang.org/x/crypto/x509roots/fallback"
 )
 
@@ -80,8 +79,6 @@ func main() {
 		tlsLeafTTL = flag.Duration("tls-leaf-validity", 0, "how long minted per-SNI certificates are valid (0 = built-in default; always clamped to the CA's own expiry)")
 		tlsCAStdin = flag.Bool("tls-ca-stdin", false, "read the interception CA (certificate and private key, one PEM stream) from stdin instead of from files")
 
-		// Verifying the real dependency when a request on an intercepted HTTPS
-		// connection is not faulted and is forwarded to it.
 		upstreamCAFile   = flag.String("upstream-ca-file", "", "PEM CA certificates trusted, in addition to the system roots, to verify the dependency when an intercepted HTTPS request is forwarded (dependencies with a private CA)")
 		upstreamInsecure = flag.Bool("upstream-insecure-skip-verify", false, "forward intercepted HTTPS requests without verifying the dependency's certificate (test environments only)")
 
@@ -326,9 +323,7 @@ func loadRules(path string) ([]fault.Rule, error) {
 	return config.Load(path)
 }
 
-// loadUpstreamCAs reads the CA certificates trusted, on top of the system
-// roots, to verify a dependency that has a private CA. An empty path means
-// none; a file without any certificate is an error rather than silently
+// loadUpstreamCAs rejects a file without any certificate rather than silently
 // trusting nothing extra.
 func loadUpstreamCAs(path string) (*x509.CertPool, error) {
 	if path == "" {

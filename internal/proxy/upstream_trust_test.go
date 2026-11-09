@@ -20,8 +20,6 @@ import (
 // proxy has to verify. These tests use httptest's certificate as a dependency
 // with a private CA: one the system roots and the built-in ones do not know.
 
-// TestServer_TLSInject_ForwardsToDependencyWithTrustedCA trusts the
-// dependency's private CA explicitly: the request is forwarded.
 func TestServer_TLSInject_ForwardsToDependencyWithTrustedCA(t *testing.T) {
 	statuses, s := forwardOnce(t, upstreamHost, &Server{}, true)
 	if statuses[http.StatusOK] != 1 {
@@ -32,8 +30,6 @@ func TestServer_TLSInject_ForwardsToDependencyWithTrustedCA(t *testing.T) {
 	}
 }
 
-// TestServer_TLSInject_InsecureSkipVerifyForwardsAnyDependency skips the
-// verification: a dependency nobody trusts is forwarded to anyway.
 func TestServer_TLSInject_InsecureSkipVerifyForwardsAnyDependency(t *testing.T) {
 	statuses, _ := forwardOnce(t, upstreamHost, &Server{UpstreamInsecureSkipVerify: true}, false)
 	if statuses[http.StatusOK] != 1 {
@@ -41,9 +37,7 @@ func TestServer_TLSInject_InsecureSkipVerifyForwardsAnyDependency(t *testing.T) 
 	}
 }
 
-// TestServer_TLSInject_TrustedCAStillChecksTheHostname trusts the CA but asks
-// for a hostname the dependency's certificate is not for: trusting a CA must
-// not mean accepting any certificate it signed.
+// Trusting a CA must not mean accepting any certificate it signed.
 func TestServer_TLSInject_TrustedCAStillChecksTheHostname(t *testing.T) {
 	statuses, s := forwardOnce(t, "other.test", &Server{}, true)
 	if statuses[http.StatusBadGateway] != 1 {
@@ -54,9 +48,6 @@ func TestServer_TLSInject_TrustedCAStillChecksTheHostname(t *testing.T) {
 	}
 }
 
-// TestServer_TLSInject_WrongTrustedCAIsRejected trusts a CA, but not the one
-// that signed the dependency's certificate: as with no trusted CA at all, the
-// request gets a 502 counted as an upstream error.
 func TestServer_TLSInject_WrongTrustedCAIsRejected(t *testing.T) {
 	_, otherCAPEM := newInterceptCA(t)
 	other := x509.NewCertPool()
@@ -72,9 +63,8 @@ func TestServer_TLSInject_WrongTrustedCAIsRejected(t *testing.T) {
 	}
 }
 
-// TestServer_TLSInject_ForwardsOverHTTP2WhenTheDependencyOffersIt checks the
-// proxy's own leg to the dependency: whatever the client speaks, forwarded
-// requests reach a dependency that offers HTTP/2 over HTTP/2.
+// The proxy's own leg to the dependency negotiates HTTP/2 whatever the client
+// speaks.
 func TestServer_TLSInject_ForwardsOverHTTP2WhenTheDependencyOffersIt(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -119,10 +109,7 @@ func TestServer_TLSInject_ForwardsOverHTTP2WhenTheDependencyOffersIt(t *testing.
 	}
 }
 
-// forwardOnce sends one request for host through an intercepting proxy built
-// from base, with a rule that never faults, so the request is forwarded. With
-// trustUpstream, the test upstream's certificate is added to the proxy's
-// trusted CAs.
+// forwardOnce uses a rule that never faults, so the request is forwarded.
 func forwardOnce(t *testing.T, host string, base *Server, trustUpstream bool) (map[int]int, metrics.Snapshot) {
 	t.Helper()
 	upstream, dst := startH2CapableTLSUpstream(t)

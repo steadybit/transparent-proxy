@@ -293,9 +293,8 @@ func (c *httpConn) upstreamReusable() bool {
 }
 
 // countRequest records a request that matched a rule and, if its fault applies,
-// that it was faulted. The connection, identified by identity, counts as
-// faulted once, on its first faulted request; connFaulted tracks that and may
-// be shared by concurrent requests (HTTP/2).
+// that it was faulted. connFaulted makes the connection count as faulted once,
+// also when its HTTP/2 requests run concurrently.
 func (s *Server) countRequest(host, identity string, action fault.Action, connFaulted *atomic.Bool) {
 	if action.Rule == "" {
 		return

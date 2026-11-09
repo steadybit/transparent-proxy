@@ -19,11 +19,8 @@ import (
 	"github.com/steadybit/transparent-proxy/internal/tlsinject"
 )
 
-// serveIntercepted handles a matched HTTPS connection through the interception
-// CA request by request, so the rule's probability applies to every request,
-// also on a keep-alive HTTP/1.1 or a multiplexed HTTP/2 connection. Faulted
-// requests are answered by the proxy; the others are forwarded to the real
-// dependency over a TLS connection of the proxy's own.
+// serveIntercepted rolls the fault per request rather than per connection, so
+// the probability also holds for keep-alive and multiplexed HTTP/2 clients.
 func (s *Server) serveIntercepted(ctx context.Context, log *slog.Logger, client *net.TCPConn, dst netip.AddrPort, identity string, prefix []byte) {
 	c := &interceptedConn{s: s, log: log, dst: dst, identity: identity}
 	upstream := s.upstreamTransport(dst)
@@ -35,20 +32,14 @@ func (s *Server) serveIntercepted(ctx context.Context, log *slog.Logger, client 
 			if r.Out.URL.Host == "" {
 				r.Out.URL.Host = identity
 			}
-			// ReverseProxy strips these when Rewrite is set; a request that
-			// is not faulted must reach the dependency as the workload sent it.
-			for _, h := range forwardedHeaders {
-				if v, ok := r.In.Header[h]; ok {
-					r.Out.Header[h] = v
-				}
-			}
+			keepForwardedHeaders(r)
 		},
 		Transport:    upstream,
 		ErrorLog:     discardLog,
 		ErrorHandler: c.upstreamFailed,
 	}
 
-	err := s.TLSInject.Serve(ctx, client, prefix, s.peekTimeout(), http.HandlerFunc(c.serve))
+	err := s.TLSInject.Serve(ctx, client, prefix, s.peekTimeout(), http.HandlerFunc(c.faultOrForward))
 
 	var rejErr *tlsinject.RejectedError
 	switch {
@@ -75,8 +66,8 @@ func (s *Server) serveIntercepted(ctx context.Context, log *slog.Logger, client 
 	}
 }
 
-// interceptedConn is the per-connection state of serveIntercepted. Its
-// handler runs concurrently for the streams of an HTTP/2 connection.
+// interceptedConn's flags are atomic because its handler runs concurrently for
+// the streams of an HTTP/2 connection.
 type interceptedConn struct {
 	s        *Server
 	log      *slog.Logger
@@ -88,9 +79,7 @@ type interceptedConn struct {
 	forwarded atomic.Bool
 }
 
-// serve answers one request: with the rule's fault if it applies this time,
-// otherwise by forwarding it to the real dependency.
-func (c *interceptedConn) serve(w http.ResponseWriter, r *http.Request) {
+func (c *interceptedConn) faultOrForward(w http.ResponseWriter, r *http.Request) {
 	host := hostWithoutPort(r.Host)
 	action := c.s.Faults.Match(c.dst, host)
 	c.s.countRequest(host, c.identity, action, &c.faulted)
@@ -126,11 +115,9 @@ func (c *interceptedConn) serve(w http.ResponseWriter, r *http.Request) {
 	c.proxy.ServeHTTP(w, r)
 }
 
-// upstreamFailed answers a forwarded request whose dependency could not be
-// reached. A 502 is what a gateway would answer; the request is not a fault
-// the attack injected, so it is counted as an upstream error. A request the
-// client gave up on (stream reset, timeout, disconnect) is neither: there is
-// no one left to answer.
+// upstreamFailed answers 502, as a gateway would, and counts an upstream error
+// rather than a fault: the attack did not cause it. A request the client gave
+// up on is neither, and there is no one left to answer.
 func (c *interceptedConn) upstreamFailed(w http.ResponseWriter, r *http.Request, err error) {
 	if r.Context().Err() != nil {
 		c.log.Debug("client cancelled a forwarded request", slog.Any("err", err))
@@ -141,12 +128,9 @@ func (c *interceptedConn) upstreamFailed(w http.ResponseWriter, r *http.Request,
 	w.WriteHeader(http.StatusBadGateway)
 }
 
-// upstreamTransport forwards an intercepted connection's requests to its
-// original destination dst, whatever the request's host, over the proxy's own
-// TLS connections: SNI is the request's host and the dependency's certificate
-// is verified (see upstreamTLSConfig), so the proxy never forwards to an
-// impostor. HTTP/2 is used when
-// the dependency offers it.
+// upstreamTransport dials the connection's original destination instead of
+// resolving the request's host, so requests reach the dependency the workload
+// chose. Its certificate is still verified for the request's host.
 func (s *Server) upstreamTransport(dst netip.AddrPort) *http.Transport {
 	return &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -164,9 +148,16 @@ func (s *Server) upstreamTransport(dst netip.AddrPort) *http.Transport {
 	}
 }
 
-// forwardedHeaders are the proxy headers the workload may have set, which
-// ReverseProxy would otherwise drop from a forwarded request.
-var forwardedHeaders = []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"}
+// keepForwardedHeaders restores what ReverseProxy strips when Rewrite is set:
+// a request that is not faulted must reach the dependency as the workload sent
+// it.
+func keepForwardedHeaders(r *httputil.ProxyRequest) {
+	for _, h := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+		if v, ok := r.In.Header[h]; ok {
+			r.Out.Header[h] = v
+		}
+	}
+}
 
 // discardLog silences net/http's own logging of client-side noise, which
 // would otherwise bypass the proxy's structured logger.

@@ -58,8 +58,6 @@ func poolOf(certs ...*x509.Certificate) *x509.CertPool {
 	return pool
 }
 
-// newPrivateCAWithLeaf returns a self-signed CA and a server certificate it
-// issued for host.
 func newPrivateCAWithLeaf(t *testing.T, host string) (ca, leaf *x509.Certificate) {
 	t.Helper()
 	caKey := newKey(t)
@@ -93,7 +91,6 @@ func newKey(t *testing.T) *ecdsa.PrivateKey {
 	return key
 }
 
-// createCert signs tmpl with signer, as parent (itself when nil).
 func createCert(t *testing.T, tmpl, parent *x509.Certificate, key *ecdsa.PrivateKey, signer crypto.Signer) *x509.Certificate {
 	t.Helper()
 	if parent == nil {

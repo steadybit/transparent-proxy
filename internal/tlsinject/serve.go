@@ -122,7 +122,7 @@ func (c *CA) Serve(ctx context.Context, conn net.Conn, clientHello []byte, hands
 	if err := serveOne(tc, state.track(handler)); err != nil {
 		return err
 	}
-	if !state.end() {
+	if !state.endedWithoutRequest() {
 		return nil // at least one request was served
 	}
 	if ctx.Err() != nil {
@@ -145,9 +145,8 @@ const (
 	connEnded               // ended without any request
 )
 
-// track wraps handler so the first request marks the connection served. A
-// request arriving after the connection was already reported as ended is
-// dropped rather than served.
+// track drops a request arriving after the connection was reported as ended,
+// which would otherwise be counted as both a rejection and a served request.
 func (s *connState) track(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.v.CompareAndSwap(connIdle, connServed) && s.v.Load() == connEnded {
@@ -157,9 +156,7 @@ func (s *connState) track(handler http.Handler) http.Handler {
 	})
 }
 
-// end reports whether the connection ended without serving any request, and
-// from then on drops late requests.
-func (s *connState) end() bool { return s.v.CompareAndSwap(connIdle, connEnded) }
+func (s *connState) endedWithoutRequest() bool { return s.v.CompareAndSwap(connIdle, connEnded) }
 
 // ErrNotDelivered reports a connection that ended without a response and
 // without the client refusing us — teardown, essentially. It is returned so the
@@ -220,10 +217,8 @@ func serveOne(tc *tls.Conn, handler http.Handler) error {
 	return nil
 }
 
-// ServeHTTP writes the forged response, so Response can be served for any
-// request. It is shared by the HTTP/1.1 and HTTP/2 paths, so both produce an
-// identical status, header set and body. It leaves the connection's lifetime
-// to the caller.
+// ServeHTTP leaves the connection's lifetime to the caller, so a faulted
+// request does not close a connection other requests may still use.
 func (r Response) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	status := r.resolvedStatus()
 	body := r.resolvedBody()

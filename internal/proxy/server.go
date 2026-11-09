@@ -83,14 +83,11 @@ type Server struct {
 	// spliced through untouched exactly as before.
 	TLSInject *tlsinject.CA
 
-	// UpstreamTrustedCAs are trusted, in addition to the system roots (or the
-	// roots built into the binary where there are none), to verify the real
-	// dependency when a request on an intercepted HTTPS connection is
-	// forwarded to it: a dependency whose certificate comes from a private CA.
+	// UpstreamTrustedCAs are trusted on top of the system and built-in roots
+	// when forwarding intercepted HTTPS, for dependencies with a private CA.
 	UpstreamTrustedCAs *x509.CertPool
 
-	// UpstreamInsecureSkipVerify forwards to the real dependency without
-	// verifying its certificate. For test environments only.
+	// UpstreamInsecureSkipVerify is for test environments only.
 	UpstreamInsecureSkipVerify bool
 
 	// listenPort and localAddrs are captured at Serve time for the self-loop
@@ -286,9 +283,8 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		return
 	}
 
-	// HTTPS through the interception CA likewise: every matched connection is
-	// decrypted, and the probability applies to each request on it instead of
-	// deciding once whether the whole connection is intercepted.
+	// HTTPS through the interception CA likewise: rolling per request means
+	// decrypting every matched connection, faulted or not.
 	if matched && rule.HTTPStatus != 0 && proto == protoTLS && s.TLSInject != nil && identity != "" {
 		if early != nil {
 			_ = early.Close()
@@ -341,10 +337,8 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		}
 	}
 
-	// An HTTP status rule never gets here on cleartext HTTP (serveHTTP) or on
-	// HTTPS with a CA (serveIntercepted). Without a CA, or without an SNI to
-	// mint a certificate for, HTTPS is spliced through untouched, which is the
-	// pre-CA behaviour.
+	// HTTPS without a CA, or without an SNI to mint a certificate for, cannot
+	// be decrypted and is spliced through even with an HTTP status rule.
 	s.forward(ctx, log, client, dst, prefix, nil, early)
 }
 

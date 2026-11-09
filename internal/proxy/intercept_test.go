@@ -20,10 +20,8 @@ import (
 	"github.com/steadybit/transparent-proxy/internal/metrics"
 )
 
-// TestServer_TLSInject_WebSocketOutlivesTheUpgrade sends an upgrade request
-// that is not faulted through an intercepted connection. The tunnel after the
-// 101 must keep working: the connection is the handler's from then on, and
-// must not be closed under it when the HTTP server lets go of it.
+// After the 101 the HTTP server lets go of the connection, but the tunnel
+// still uses it.
 func TestServer_TLSInject_WebSocketOutlivesTheUpgrade(t *testing.T) {
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") != "echo" {
@@ -94,9 +92,8 @@ func TestServer_TLSInject_WebSocketOutlivesTheUpgrade(t *testing.T) {
 	}
 }
 
-// TestServer_TLSInject_ForwardingKeepsForwardedHeaders forwards a request that
-// was not faulted: the proxy headers the workload set must reach the
-// dependency unchanged, as on the cleartext path.
+// ReverseProxy drops these headers unless told otherwise; the cleartext path
+// keeps them.
 func TestServer_TLSInject_ForwardingKeepsForwardedHeaders(t *testing.T) {
 	got := make(chan http.Header, 1)
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -137,9 +134,6 @@ func TestServer_TLSInject_ForwardingKeepsForwardedHeaders(t *testing.T) {
 	}
 }
 
-// TestServer_TLSInject_ClientCancellationIsNoUpstreamError cancels a forwarded
-// request while the dependency is still answering. The client gave up, the
-// dependency did not fail: it must not count as an upstream error.
 func TestServer_TLSInject_ClientCancellationIsNoUpstreamError(t *testing.T) {
 	cancelled := make(chan struct{})
 	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
