@@ -77,8 +77,8 @@ type Server struct {
 	Metrics *metrics.Metrics
 
 	// TLSInject, when non-nil, enables HTTPS interception: a matched TLS
-	// connection with a status or latency fault is terminated with a
-	// certificate minted for its SNI, so the fault applies per request.
+	// connection is terminated with a certificate minted for its SNI, so its
+	// status, latency or reset applies per request.
 	// Nil (the default) means TLS is never decrypted — HTTPS connections are
 	// spliced through untouched exactly as before.
 	TLSInject *tlsinject.CA
@@ -339,16 +339,17 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 
 	// HTTPS without a CA, or without an SNI to mint a certificate for, cannot
 	// be decrypted and is spliced through even with an HTTP status rule; its
-	// latency is rolled once for the whole connection.
+	// latency or reset is rolled once for the whole connection.
 	s.forward(ctx, log, client, dst, prefix, nil, early)
 }
 
-// worthDecrypting reports whether a rule's fault needs the requests inside TLS:
-// a status replaces a response and a latency delays each request. An
-// abort-only rule resets the TCP connection, which needs no decryption, so
-// it is not worth the wider impact of decrypting every matched connection.
+// worthDecrypting reports whether a rule's fault needs the requests inside TLS
+// to be rolled per request: a status replaces a response, a latency delays
+// each request, and an abort resets each request rather than the connection
+// once, which a keep-alive client would only feel until a connection won the
+// roll.
 func worthDecrypting(rule fault.Rule) bool {
-	return rule.HTTPStatus != 0 || rule.Latency > 0
+	return rule.HTTPStatus != 0 || rule.Latency > 0 || rule.Abort
 }
 
 // forward splices the connection through to the upstream — the one given, or a
