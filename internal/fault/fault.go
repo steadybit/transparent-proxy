@@ -29,8 +29,8 @@ type Rule struct {
 	Hosts []string
 
 	// Probability in [0,1] gates whether this rule's fault is applied to a
-	// matching request (cleartext HTTP; HTTPS through the interception CA when
-	// HTTPStatus or Latency is set) or connection (everything else). A nil pointer means
+	// matching request (cleartext HTTP; HTTPS through the interception CA) or
+	// connection (everything else). A nil pointer means
 	// unset → always (1.0); an explicit 0 means never; values are used as given
 	// otherwise.
 	Probability *float64
