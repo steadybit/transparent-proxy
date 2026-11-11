@@ -5,6 +5,8 @@
 #   intercept-ca  — the proxy mints per-SNI leaves with it; the client trusts it.
 #   upstream-ca   — signs the upstream server's certificate; only the proxy is
 #                   told about it (--upstream-ca-file).
+#   both-cas.crt  — both CAs, for a client that must accept the proxy's minted
+#                   certificate and the real one alike (the reset cases).
 set -eu
 cd "$(dirname "$0")"
 mkdir -p certs
@@ -24,6 +26,7 @@ printf "subjectAltName=DNS:upstream.test\nextendedKeyUsage=serverAuth\n" > serve
 openssl x509 -req -in server.csr -CA upstream-ca.crt -CAkey upstream-ca.key \
   -CAcreateserial -days 30 -extfile server.ext -out server.crt 2>/dev/null
 rm -f server.csr server.ext upstream-ca.srl
+cat intercept-ca.crt upstream-ca.crt > both-cas.crt
 chmod 644 *.key
 '
 echo "certificates written to $PWD/certs"

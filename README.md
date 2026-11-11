@@ -119,10 +119,9 @@ selectors match — an empty selector means "any".
 - `httpStatus` — synthesize this HTTP status (L7). Cleartext HTTP always; HTTPS
   only with an interception CA (see below).
 - `probability` — `[0,1]` chance to apply the fault (unset = always, `0` =
-  never), per request for cleartext HTTP and, for rules with an `httpStatus`
-  or a `latency`, for HTTPS through the interception CA; per connection
-  otherwise (e.g. an `abort`-only rule on HTTPS, or a `latency` rule without
-  `hosts`).
+  never), per request for cleartext HTTP and HTTPS through the interception
+  CA; per connection otherwise (e.g. HTTPS without a CA, or a `latency` or
+  `abort` rule without `hosts`).
 
 ### How probability applies
 
@@ -140,16 +139,19 @@ The metrics count these requests as `requests_matched` and
 can be checked against `probability`; the `connections_*` counters stay per
 connection.
 
-**HTTPS through the interception CA — per request** as well, for rules with an
-`httpStatus` or a `latency`: the connection is decrypted and each request
-rolled on its own (see [HTTPS response injection](#https-response-injection)).
-An `abort`-only rule is not worth decrypting for and resets the TCP connection
-instead.
+**HTTPS through the interception CA — per request** as well: the connection
+is decrypted and each request rolled on its own (see
+[HTTPS response injection](#https-response-injection)). An `abort` resets the
+request's stream on HTTP/2, so the client keeps the connection; on HTTP/1.1 it
+closes the connection. Most HTTP/1.1 clients, curl and Go's included, silently
+resend a request whose reused connection closed without a reply, so they see
+fewer failures than `probability`; `requests_faulted` still counts every
+reset.
 
 **Everything else — per connection.** TLS without an interception CA, and
 non-HTTP TCP, are rolled once when the connection opens, and every request on it shares that outcome.
-So is any connection a rule with a `latency` but no `hosts` (and no
-`httpStatus`) matches: the proxy keeps it on the splice fast path and never
+So is any connection a rule with a `latency` or an `abort` but no `hosts` (and
+no `httpStatus`) matches: the proxy keeps it on the splice fast path and never
 reads it, whatever the protocol. A keep-alive
 client that wins the roll keeps the connection, so the observed failure rate
 of its requests can be far below `probability`.
@@ -167,8 +169,8 @@ Limits of the per-request path:
 By default the proxy never decrypts TLS: it reads the SNI in cleartext and
 splices the bytes through. Supplying a CA opts in to terminating **matched**
 HTTPS connections so an `httpStatus` fault can be synthesized inside TLS, and
-a `latency` fault can delay every request rather than only the first one on a
-connection:
+a `latency` or `abort` fault can delay or reset each request rather than the
+connection once:
 
 ```bash
 transparent-proxy \
@@ -260,9 +262,9 @@ splicing connections that are not faulted:
 **When it does not apply** — the connection is spliced through, not decrypted:
 
 - no CA configured, or the client sent no SNI;
-- the rule carries neither `httpStatus` nor `latency`;
-- the rule carries a `latency` but no `hosts` (and no `httpStatus`): the
-  connection is never read, so its latency applies once per connection.
+- the rule carries a `latency` or an `abort` but no `hosts` (and no
+  `httpStatus`): the connection is never read, so its fault applies once per
+  connection.
 
 **When the client refuses** — if the workload does not trust the CA (or pins
 certificates) it either fails the handshake, or, under TLS 1.3, completes it and
