@@ -43,7 +43,7 @@ type Rule struct {
 	// Abort, when true, resets the connection (RST) instead of proxying it,
 	// simulating a refused/flaky dependency. On HTTPS through the interception
 	// CA it aborts the request instead: the stream is reset on HTTP/2, and the
-	// connection closed on HTTP/1.1.
+	// TCP connection reset on HTTP/1.1, as on cleartext HTTP.
 	Abort bool
 
 	// HTTPStatus, if non-zero, makes the proxy synthesize an HTTP response with

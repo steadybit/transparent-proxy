@@ -38,10 +38,10 @@ Each case but 1, 12, 17 and 19 sends its requests over a single keep-alive
 connection, so the share of `503`s shows the probability is rolled per request;
 those four open a new connection per request. Each case reports how many connections it opened.
 
-A reset request gets no response, shown as `000` with curl's exit code: `52`
-(empty reply) when the proxy closes an HTTPS HTTP/1.1 connection, `56`
-(connection reset) for a TCP reset, `92` for an HTTP/2 stream reset, and `35`
-when the connection is reset before the TLS handshake. On HTTP/1.1 keep-alive,
+A reset request gets no response, shown as `000` with curl's exit code: `56`
+(connection reset) for a TCP reset, on HTTP/1.1 over HTTPS as on plain HTTP,
+`92` for an HTTP/2 stream reset, and `35` when the connection is reset before
+the TLS handshake. On HTTP/1.1 keep-alive,
 curl resends a request whose reused connection ended without a reply on a new
 connection, so a request gets a `000` only when that retry is reset too. The
 proxy rolls the retries like any other request, so cases 15 and 18 check that
