@@ -99,7 +99,7 @@ func clientVia(t *testing.T, proxyAddr netip.AddrPort, upstream *httptest.Server
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", proxyAddr.String())
 		},
-		TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		TLSClientConfig: httpsClientTLS(pool, false),
 	}
 	t.Cleanup(tr.CloseIdleConnections)
 	return &http.Client{Transport: tr, Timeout: 10 * time.Second}

@@ -22,10 +22,17 @@ import (
 // inspected-path tests deterministic without hand-rolling the handshake.
 func captureClientHello(t *testing.T, serverName string) []byte {
 	t.Helper()
+	return captureClientHelloOffering(t, serverName, nil)
+}
+
+// captureClientHelloOffering is captureClientHello with the given ALPN
+// protocols; nil offers no ALPN.
+func captureClientHelloOffering(t *testing.T, serverName string, alpn []string) []byte {
+	t.Helper()
 	client, server := net.Pipe()
 	defer client.Close()
 	go func() {
-		_ = tls.Client(client, &tls.Config{ServerName: serverName, InsecureSkipVerify: true}).Handshake()
+		_ = tls.Client(client, &tls.Config{ServerName: serverName, NextProtos: alpn, InsecureSkipVerify: true}).Handshake()
 	}()
 
 	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))

@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"syscall"
 	"time"
 
@@ -285,7 +286,7 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 
 	// HTTPS through the interception CA likewise: rolling per request means
 	// decrypting every matched connection, faulted or not.
-	if matched && worthDecrypting(rule) && proto == protoTLS && s.TLSInject != nil && identity != "" {
+	if matched && proto == protoTLS && s.TLSInject != nil && identity != "" && worthDecrypting(rule, offeredALPN(prefix), dst.Port()) {
 		if early != nil {
 			_ = early.Close()
 			early = nil
@@ -337,19 +338,41 @@ func (s *Server) handle(ctx context.Context, client *net.TCPConn) {
 		}
 	}
 
-	// HTTPS without a CA, or without an SNI to mint a certificate for, cannot
-	// be decrypted and is spliced through even with an HTTP status rule; its
-	// latency or reset is rolled once for the whole connection.
+	// TLS without a CA, without an SNI to mint a certificate for, or without
+	// HTTP in its ALPN is not decrypted and is spliced through even with an HTTP
+	// status rule; its latency or reset is rolled once for the whole connection.
 	s.forward(ctx, log, client, dst, prefix, nil, early)
 }
 
-// worthDecrypting reports whether a rule's fault needs the requests inside TLS
-// to be rolled per request: a status replaces a response, a latency delays
-// each request, and an abort resets each request rather than the connection
-// once, which a keep-alive client would only feel until a connection won the
-// roll.
-func worthDecrypting(rule fault.Rule) bool {
-	return rule.HTTPStatus != 0 || rule.Latency > 0 || rule.Abort
+// worthDecrypting states the TLS connections faulted per request, like
+// cleartext HTTP: a rule with an HTTP fault (a status, a latency or a reset) on
+// a connection that speaks HTTP — its ALPN offers h2 or http/1.1, or, from a
+// client that offers no ALPN at all, it goes to the HTTPS port 443. Many HTTP
+// clients send no ALPN (Go's HTTP/1.1 transport with its own TLS config, Java's
+// HttpsURLConnection, Apache HttpClient 4), but neither do non-HTTP protocols
+// such as Kafka over TLS, which would break if served as HTTP; the port tells
+// them apart. Every other TLS connection is spliced through, its fault rolled
+// once for the whole connection.
+func worthDecrypting(rule fault.Rule, alpn []string, port uint16) bool {
+	if rule.HTTPStatus == 0 && rule.Latency <= 0 && !rule.Abort {
+		return false
+	}
+	if len(alpn) == 0 {
+		return port == httpsPort
+	}
+	return slices.ContainsFunc(alpn, func(p string) bool { return p == "h2" || p == "http/1.1" })
+}
+
+// httpsPort is where a TLS client that offers no ALPN is taken to speak HTTP.
+const httpsPort = 443
+
+// offeredALPN returns the ALPN protocols of the ClientHello read while
+// sniffing; consumed starts with the TLS record header.
+func offeredALPN(consumed []byte) []string {
+	if len(consumed) <= tlsRecordHeaderLen {
+		return nil
+	}
+	return parseALPN(consumed[tlsRecordHeaderLen:])
 }
 
 // forward splices the connection through to the upstream — the one given, or a

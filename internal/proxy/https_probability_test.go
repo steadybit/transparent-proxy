@@ -92,7 +92,7 @@ func newKeepAliveHTTPSClient(t *testing.T, proxyAddr netip.AddrPort, upstream *h
 			c.dials.Add(1)
 			return dialer.DialContext(ctx, network, proxyAddr.String())
 		},
-		TLSClientConfig:     &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		TLSClientConfig:     httpsClientTLS(pool, http2),
 		ForceAttemptHTTP2:   http2,
 		MaxIdleConnsPerHost: 1,
 	}
@@ -115,6 +115,17 @@ func (c *keepAliveClient) sendGetsByProto(t *testing.T, url string, n int) (stat
 		protos[resp.Proto]++
 	}
 	return statuses, protos
+}
+
+// httpsClientTLS offers the client's HTTP protocol in its ALPN, as most HTTP
+// clients do: without it, Go's HTTP/1.1 transport sends no ALPN, and the proxy
+// only takes such a client for HTTP on port 443, which no test listens on.
+func httpsClientTLS(pool *x509.CertPool, http2 bool) *tls.Config {
+	cfg := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	if !http2 {
+		cfg.NextProtos = []string{"http/1.1"}
+	}
+	return cfg
 }
 
 // certPool trusts the test upstream's certificate, standing in for the system

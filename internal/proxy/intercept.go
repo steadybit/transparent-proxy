@@ -22,7 +22,7 @@ import (
 // serveIntercepted rolls the fault per request rather than per connection, so
 // the probability also holds for keep-alive and multiplexed HTTP/2 clients.
 func (s *Server) serveIntercepted(ctx context.Context, log *slog.Logger, client *net.TCPConn, dst netip.AddrPort, identity string, prefix []byte) {
-	c := &interceptedConn{s: s, log: log, dst: dst, identity: identity}
+	c := &interceptedConn{s: s, log: log, client: client, dst: dst, identity: identity}
 	upstream := s.upstreamTransport(dst)
 	defer upstream.CloseIdleConnections()
 	c.proxy = &httputil.ReverseProxy{
@@ -71,6 +71,7 @@ func (s *Server) serveIntercepted(ctx context.Context, log *slog.Logger, client 
 type interceptedConn struct {
 	s        *Server
 	log      *slog.Logger
+	client   *net.TCPConn
 	dst      netip.AddrPort
 	identity string
 	proxy    *httputil.ReverseProxy
@@ -87,7 +88,13 @@ func (c *interceptedConn) faultOrForward(w http.ResponseWriter, r *http.Request)
 	if action.Abort {
 		c.s.Metrics.Aborted()
 		c.log.Debug("aborting request")
-		// Resets the stream on HTTP/2 and closes the connection on HTTP/1.1.
+		// HTTP/1.1 carries one request at a time, so resetting the TCP
+		// connection fails just this request, as on cleartext HTTP; a plain
+		// close would read as a clean EOF instead of a reset. On HTTP/2 the
+		// panic resets only this stream and the connection's other streams go on.
+		if r.ProtoMajor == 1 {
+			reset(c.client)
+		}
 		panic(http.ErrAbortHandler)
 	}
 
