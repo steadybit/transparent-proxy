@@ -2,7 +2,8 @@
 # Walks through HTTPS interception end to end: a client calls
 # https://upstream.test, whose certificate comes from a private CA, while the
 # proxy runs in the client's network namespace and faults half the requests.
-# Cases 11-14 do the same over plain HTTP (http://upstream.test, port 80).
+# Cases 11-14 do the same over plain HTTP (http://upstream.test, port 80), and
+# cases 15-19 reset half the requests (--fault-reset) over HTTPS and HTTP.
 #
 #   ./run.sh            all cases
 #   ./run.sh 2 5        only cases 2 and 5
@@ -86,7 +87,7 @@ stop_proxy() {
   expect "direct http/https responses after stop" "$direct" "200 200"
   METRICS=$(grep '"proxy stopped"' <<<"$logs" || true)
   printf '  proxy metrics:'
-  for k in requests_matched requests_faulted latency_applied upstream_errors tls_intercept_rejected; do
+  for k in requests_matched requests_faulted latency_applied connections_aborted upstream_errors tls_intercept_rejected; do
     printf ' %s:%s' "$k" "$(metric "$k")"
   done
   echo
@@ -132,6 +133,13 @@ timed_requests() {
   tally '{ print $1, ($2 >= late ? "after ~200ms" : "at once") }'
 }
 
+# reset_requests <curl flags...>: as requests, tallying the status codes with
+# curl's exit code, which tells how a reset request failed (000: no response).
+reset_requests() {
+  LAST=$(curl_batch '%{http_code} curl_exit=%{exitcode} %{num_connects}' "$@")
+  tally '{ print $1, $2 }'
+}
+
 # tally <awk program>: counts the lines it prints for LAST, and the connections.
 tally() {
   [[ -n $LAST ]] || return 0
@@ -172,6 +180,31 @@ expect_split() {
   expect_about_half "$1 responses" "\$1 == $1"
   expect requests_matched "$(metric requests_matched)" "$REQUESTS"
   expect requests_faulted "$(metric requests_faulted)" "$(count "\$1 == $1")"
+}
+
+# expect_reset_split: every response is a 200 or none (000), about half none,
+# and the proxy counted every request and reset exactly the ones that got none.
+expect_reset_split() {
+  expect_all "responses 200 or 000" '$1 == 200 || $1 == "000"'
+  expect_about_half "000 responses (reset)" '$1 == "000"'
+  expect requests_matched "$(metric requests_matched)" "$REQUESTS"
+  expect requests_faulted "$(metric requests_faulted)" "$(count '$1 == "000"')"
+  expect connections_aborted "$(metric connections_aborted)" "$(count '$1 == "000"')"
+}
+
+# expect_reset_retried: a reset on a reused HTTP/1.1 connection is retried by
+# curl on a new one, so a request gets a 000 only when that retry is reset too.
+# The proxy sees the retries as requests of their own: about half of all it
+# matched are reset, and each reset ends a connection.
+expect_reset_retried() {
+  local matched faulted d
+  matched=$(metric requests_matched)
+  faulted=$(metric requests_faulted)
+  expect_all "responses 200 or 000" '$1 == 200 || $1 == "000"'
+  ((matched >= REQUESTS)) || FAILS+=("requests_matched: got $matched, expected at least $REQUESTS")
+  d=$((2 * faulted - matched))
+  ((d * d <= 9 * matched)) || FAILS+=("requests_faulted: got $faulted of $matched, expected about half")
+  expect connections_aborted "$(metric connections_aborted)" "$faulted"
 }
 
 # verdict <case>
@@ -389,6 +422,57 @@ case_14() {
   expect "connections" "$(connections)" 1
 }
 
+# Resets: the proxy answers nothing, so a reset request gets no response (000).
+case_15() {
+  local FAULT=(--fault-reset)
+  echo "== 15. reset only, HTTPS keep-alive over HTTP/1.1 (expect decrypted, rolled per request:"
+  echo "       ~half the requests the proxy sees reset; curl retries most of them on a new connection)"
+  start_proxy --upstream-ca-file certs/upstream-ca.crt
+  reset_requests --cacert /certs/both-cas.crt
+  stop_proxy
+  expect_reset_retried
+}
+
+case_16() {
+  local FAULT=(--fault-reset)
+  echo "== 16. reset only, HTTPS over HTTP/2 (expect ~half 000 from a stream reset, the rest 200, on one connection)"
+  start_proxy --upstream-ca-file certs/upstream-ca.crt
+  reset_requests --http2 --cacert /certs/both-cas.crt
+  stop_proxy
+  expect_reset_split
+  expect "connections" "$(connections)" 1
+}
+
+case_17() {
+  local FAULT=(--fault-reset)
+  echo "== 17. reset only, HTTPS, a new connection per request (expect ~half 000, the rest 200, one connection per request)"
+  start_proxy --upstream-ca-file certs/upstream-ca.crt
+  reset_requests --cacert /certs/both-cas.crt -H 'Connection: close'
+  stop_proxy
+  expect_reset_split
+  expect "connections" "$(connections)" "$REQUESTS"
+}
+
+case_18() {
+  local URL=http://upstream.test/ FAULT=(--fault-reset)
+  echo "== 18. reset only, plain HTTP keep-alive (expect rolled per request:"
+  echo "       ~half the requests the proxy sees reset; curl retries most of them on a new connection)"
+  start_proxy
+  reset_requests
+  stop_proxy
+  expect_reset_retried
+}
+
+case_19() {
+  local URL=http://upstream.test/ FAULT=(--fault-reset)
+  echo "== 19. reset only, plain HTTP, a new connection per request (expect ~half 000, the rest 200, one connection per request)"
+  start_proxy
+  reset_requests -H 'Connection: close'
+  stop_proxy
+  expect_reset_split
+  expect "connections" "$(connections)" "$REQUESTS"
+}
+
 print_manual() {
   cat <<'EOF2'
 The lab is up, without a proxy. In one terminal open a shell in the client's
@@ -435,6 +519,14 @@ its final metrics). It faults half the requests to upstream.test with 503:
     --fault-hosts upstream.test --fault-latency 200ms --fault-http-status 503 --fault-probability 0.5 \
     --metrics-addr 127.0.0.1:9090
 
+  # reset only, over HTTPS and plain HTTP (both ports captured): rolled per
+  # request; a selected request is reset, the others forwarded -> 000 / 200
+  ./transparent-proxy --intercept-cidrs 0.0.0.0/0 --intercept-ports 80,443 \
+    --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
+    --upstream-ca-file certs/upstream-ca.crt \
+    --fault-hosts upstream.test --fault-reset --fault-probability 0.5 \
+    --metrics-addr 127.0.0.1:9090
+
   # the CA as one PEM stream on stdin, as the extension passes it:
   cat certs/intercept-ca.crt certs/intercept-ca.key | ./transparent-proxy --tls-ca-stdin ...
 
@@ -460,7 +552,14 @@ In another terminal, the client:
   # after 200ms or a 200 at once
   docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/intercept-ca.crt -w '%{http_code} %{time_total}s new_connection=%{num_connects}\n' -o /dev/null 'https://upstream.test/[1-10]'
 
-  # trusting only the real upstream CA: fails (exit 60) while a proxy with an httpStatus or a latency runs, since it answers the handshake
+  # reset only: 10 requests each over HTTPS keep-alive, HTTP/2 and plain HTTP,
+  # each a 200 or a 000 with curl's exit code (curl retries a reset on a reused
+  # HTTP/1.1 connection, so compare requests_faulted with requests_matched too)
+  docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/both-cas.crt -w '%{http_code} exit=%{exitcode} new_connection=%{num_connects}\n' -o /dev/null 'https://upstream.test/[1-10]'
+  docker exec https-lab-client-1 curl -s --http2 --cacert /certs/both-cas.crt -w '%{http_code} exit=%{exitcode} %{http_version}\n' -o /dev/null 'https://upstream.test/[1-10]'
+  docker exec https-lab-client-1 curl -s -w '%{http_code} exit=%{exitcode} new_connection=%{num_connects}\n' -o /dev/null 'http://upstream.test/[1-10]'
+
+  # trusting only the real upstream CA: fails (exit 60) while the proxy runs, since it answers the handshake
   docker exec https-lab-client-1 curl -s --cacert /certs/upstream-ca.crt https://upstream.test/; echo "exit=$?"
 
   # not trusting the interception CA: fails and counts as tls_intercept_rejected
@@ -504,7 +603,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 setup
-[[ ${#cases[@]} -gt 0 ]] || cases=(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14)
+[[ ${#cases[@]} -gt 0 ]] || cases=(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19)
 for c in "${cases[@]}"; do
   echo
   "case_$c"

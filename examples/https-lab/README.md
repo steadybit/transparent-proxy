@@ -2,7 +2,8 @@
 
 Exercises HTTPS response injection end to end, on any machine with Docker
 (macOS included: the proxy runs in a Linux container). Cases 11–14 run the same
-faults over plain HTTP, for comparison.
+faults over plain HTTP, for comparison, and cases 15–19 reset the requests
+(`--fault-reset`) instead, over HTTPS and plain HTTP.
 
 - `upstream` — nginx on `https://upstream.test`, with a certificate from a
   **private upstream CA**, and on `http://upstream.test` (port 80).
@@ -14,7 +15,9 @@ faults over plain HTTP, for comparison.
 `gen-certs.sh` creates two CAs into `certs/` (git-ignored): the **interception
 CA** the proxy mints leaves with and the client trusts, and the **upstream CA**
 that signed the server's certificate, which only the proxy is given
-(`--upstream-ca-file`).
+(`--upstream-ca-file`). `both-cas.crt` holds the two, for the reset cases: their
+client accepts the proxy's certificate and nginx's alike, so a connection the
+proxy splices instead of decrypting still gets a `200`.
 
 `run.sh` runs it on first use; nothing is committed. The certificates are valid
 for 30 days, so regenerate them (and restart the lab, so nginx picks up the new
@@ -31,9 +34,19 @@ rm -rf certs && ./gen-certs.sh && ./run.sh down
 ./run.sh down     # remove the containers
 ```
 
-Each case but 1 and 12 sends its requests over a single keep-alive connection,
-so the share of `503`s shows the probability is rolled per request; cases 1 and
-12 open a new connection per request. Each case reports how many connections it opened.
+Each case but 1, 12, 17 and 19 sends its requests over a single keep-alive
+connection, so the share of `503`s shows the probability is rolled per request;
+those four open a new connection per request. Each case reports how many connections it opened.
+
+A reset request gets no response, shown as `000` with curl's exit code: `52`
+(empty reply) when the proxy closes an HTTPS HTTP/1.1 connection, `56`
+(connection reset) for a TCP reset, `92` for an HTTP/2 stream reset, and `35`
+when the connection is reset before the TLS handshake. On HTTP/1.1 keep-alive,
+curl resends a request whose reused connection ended without a reply on a new
+connection, so a request gets a `000` only when that retry is reset too. The
+proxy rolls the retries like any other request, so cases 15 and 18 check that
+about half of the requests it matched (`requests_matched`, more than were sent)
+were reset, rather than the share of `000`s.
 
 Each case then checks its results against the table below: a green `✓` when
 they match, otherwise a yellow `✗` per mismatch, with what it got. "About half"
@@ -61,6 +74,11 @@ answering the client directly again, `200` over both HTTP and HTTPS.
 | 12 | plain HTTP, each request on a new connection | ~half `503`, the rest `200`; as many connections as requests |
 | 13 | plain HTTP, `--fault-latency 200ms` | as case 9 |
 | 14 | plain HTTP, `--fault-latency 200ms --fault-http-status 503` | as case 10 |
+| 15 | `--fault-reset` only, HTTP/1.1 keep-alive | about half the requests the proxy matched reset, each ending its connection; the rest `200` |
+| 16 | `--fault-reset` only, HTTP/2 | on one connection, ~half `000` (stream reset), the rest `200` |
+| 17 | `--fault-reset` only, each request on a new connection | ~half `000`, the rest `200`; as many connections as requests |
+| 18 | plain HTTP, `--fault-reset` only, keep-alive | as case 15 |
+| 19 | plain HTTP, `--fault-reset` only, each request on a new connection | as case 17 |
 
 The proxy uses HTTP/2 towards the upstream whenever nginx offers it, so the
 forwarded requests of cases 3–4 reach it over HTTP/2 as well; case 6 adds
@@ -121,6 +139,14 @@ logs its final metrics.
   --fault-hosts upstream.test --fault-latency 200ms --fault-http-status 503 --fault-probability 0.5 \
   --metrics-addr 127.0.0.1:9090
 
+# reset only, over HTTPS and plain HTTP (both ports captured): rolled per
+# request; a selected request is reset, the others forwarded -> 000 / 200
+./transparent-proxy --intercept-cidrs 0.0.0.0/0 --intercept-ports 80,443 \
+  --tls-ca-cert certs/intercept-ca.crt --tls-ca-key certs/intercept-ca.key \
+  --upstream-ca-file certs/upstream-ca.crt \
+  --fault-hosts upstream.test --fault-reset --fault-probability 0.5 \
+  --metrics-addr 127.0.0.1:9090
+
 # the CA as one PEM stream on stdin, as the extension passes it
 cat certs/intercept-ca.crt certs/intercept-ca.key |
   ./transparent-proxy --tls-ca-stdin --intercept-cidrs 0.0.0.0/0 --intercept-ports 443 \
@@ -151,7 +177,14 @@ docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/intercept-ca.cr
 # after 200ms or a 200 at once
 docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/intercept-ca.crt -w '%{http_code} %{time_total}s new_connection=%{num_connects}\n' -o /dev/null 'https://upstream.test/[1-10]'
 
-# trusting only the real upstream CA: fails (exit 60) while a proxy with an httpStatus or a latency runs, since it answers the handshake
+# reset only: 10 requests each over HTTPS keep-alive, HTTP/2 and plain HTTP,
+# each a 200 or a 000 with curl's exit code (curl retries a reset on a reused
+# HTTP/1.1 connection, so compare requests_faulted with requests_matched too)
+docker exec https-lab-client-1 curl -s --http1.1 --cacert /certs/both-cas.crt -w '%{http_code} exit=%{exitcode} new_connection=%{num_connects}\n' -o /dev/null 'https://upstream.test/[1-10]'
+docker exec https-lab-client-1 curl -s --http2 --cacert /certs/both-cas.crt -w '%{http_code} exit=%{exitcode} %{http_version}\n' -o /dev/null 'https://upstream.test/[1-10]'
+docker exec https-lab-client-1 curl -s -w '%{http_code} exit=%{exitcode} new_connection=%{num_connects}\n' -o /dev/null 'http://upstream.test/[1-10]'
+
+# trusting only the real upstream CA: fails (exit 60) while the proxy runs, since it answers the handshake
 docker exec https-lab-client-1 curl -s --cacert /certs/upstream-ca.crt https://upstream.test/; echo "exit=$?"
 
 # not trusting the interception CA: fails and counts as tls_intercept_rejected
@@ -186,5 +219,6 @@ rules, so the client goes straight to nginx again, and logs its final metrics
 If a proxy is killed rather than stopped (e.g. the shell's container removed
 with `docker rm -f`), its iptables rules stay behind and the next proxy's
 preflight refuses to start on top of them. Clear them from the shell with
-`./transparent-proxy --revert --intercept-cidrs 0.0.0.0/0 --intercept-ports 443`,
-or re-run `./run.sh --manual`, which does the same.
+`./transparent-proxy --revert --intercept-cidrs 0.0.0.0/0 --intercept-ports 443`
+(`80,443` after the reset command, as `--revert` takes the ports the proxy was
+started with), or re-run `./run.sh --manual`, which clears both.
