@@ -1,0 +1,56 @@
+name: tls-protocols-lab
+
+services:
+  # upstream.test: HTTPS on 443 and 8443, plain HTTP on 80.
+  upstream:
+    image: nginx:1.29-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/certs:ro
+    networks:
+      default:
+        aliases: [upstream.test]
+
+  # MQTT over TLS on upstream.test:8883: the same hostname, hence the same SNI,
+  # as the HTTPS service. It shares nginx's network namespace (and IP).
+  mqtt:
+    image: eclipse-mosquitto:2.0
+    network_mode: service:upstream
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./certs:/certs:ro
+    depends_on: [upstream]
+
+  # broker.test: MQTT over TLS on 443, a non-HTTP protocol on the
+  # HTTPS port.
+  broker:
+    image: eclipse-mosquitto:2.0
+    volumes:
+      - ./mosquitto-443.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./certs:/certs:ro
+    networks:
+      default:
+        aliases: [broker.test]
+
+  # The workload: curl and mosquitto_pub, trusting both CAs.
+  client:
+    build:
+      context: .
+      dockerfile: client.Dockerfile
+    volumes:
+      - ./certs:/certs:ro
+    depends_on: [upstream, mqtt, broker]
+
+  # Shares the client's network namespace, the way the extension runs the proxy
+  # in the target's netns. Started per case by run.sh, or as a shell by
+  # `./run.sh shell`; never by `up`.
+  proxy:
+    build: .
+    profiles: [proxy]
+    network_mode: service:client
+    cap_add: [NET_ADMIN]
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./bin/transparent-proxy:/lab/transparent-proxy:ro
+      - ./certs:/lab/certs:ro

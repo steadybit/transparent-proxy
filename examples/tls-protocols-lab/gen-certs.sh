@@ -1,0 +1,33 @@
+#!/usr/bin/env sh
+# Generates the lab's two private CAs and the upstream server certificate into
+# ./certs. Runs openssl in a container so macOS's LibreSSL is not involved.
+#
+#   intercept-ca  — the proxy mints per-SNI leaves with it.
+#   upstream-ca   — signs the dependencies' certificate (upstream.test and
+#                   broker.test); only the proxy is told about it (--upstream-ca-file).
+#   both-cas.crt  — both CAs: the client's truststore, as a workload's once the
+#                   interception CA is added to it, so a connection the proxy
+#                   decrypts and one it splices through are both trusted.
+set -eu
+cd "$(dirname "$0")"
+mkdir -p certs
+docker run --rm -v "$PWD/certs:/w" -w /w --entrypoint sh alpine/openssl -euc '
+gen_ca() {
+  openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=$2" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -keyout "$1.key" -out "$1.crt" 2>/dev/null
+}
+gen_ca intercept-ca "TLS Protocols Lab Interception CA"
+gen_ca upstream-ca  "TLS Protocols Lab Upstream CA"
+
+openssl req -newkey rsa:2048 -nodes -subj "/CN=upstream.test" \
+  -keyout server.key -out server.csr 2>/dev/null
+printf "subjectAltName=DNS:upstream.test,DNS:broker.test\nextendedKeyUsage=serverAuth\n" > server.ext
+openssl x509 -req -in server.csr -CA upstream-ca.crt -CAkey upstream-ca.key \
+  -CAcreateserial -days 30 -extfile server.ext -out server.crt 2>/dev/null
+rm -f server.csr server.ext upstream-ca.srl
+cat intercept-ca.crt upstream-ca.crt > both-cas.crt
+chmod 644 *.key
+'
+echo "certificates written to $PWD/certs"

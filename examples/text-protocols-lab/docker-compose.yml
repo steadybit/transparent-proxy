@@ -1,0 +1,62 @@
+name: text-protocols-lab
+
+services:
+  # web.test: the HTTP dependency the attack targets.
+  web:
+    image: nginx:1.29-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/certs:ro
+    networks:
+      default:
+        aliases: [web.test]
+
+  # Dependencies the attack does NOT target, each speaking a text protocol.
+  redis:
+    image: redis:7-alpine
+    networks:
+      default:
+        aliases: [redis.test]
+  nats:
+    image: nats:2-alpine
+    networks:
+      default:
+        aliases: [nats.test]
+  ssh:
+    build:
+      context: .
+      dockerfile: ssh.Dockerfile
+    networks:
+      default:
+        aliases: [ssh.test]
+  # Answers each line it reads with "OK <line>": stands in for IRC, STOMP and
+  # other line-based protocols.
+  lines:
+    image: alpine:3.22
+    command: ["/probe", "lines", "-listen", ":7000"]
+    volumes:
+      - ./bin/probe:/probe:ro
+    networks:
+      default:
+        aliases: [lines.test]
+
+  client:
+    build:
+      context: .
+      dockerfile: client.Dockerfile
+    volumes:
+      - ./bin/probe:/usr/local/bin/probe:ro
+    depends_on: [web, redis, nats, ssh, lines]
+
+  # Shares the client's network namespace, the way the extension runs the proxy
+  # in the target's netns. Started per case by run.sh, or as a shell by
+  # `./run.sh shell`; never by `up`.
+  proxy:
+    build: .
+    profiles: [proxy]
+    network_mode: service:client
+    cap_add: [NET_ADMIN]
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./bin/transparent-proxy:/lab/transparent-proxy:ro

@@ -1,0 +1,36 @@
+name: preconnect-lab
+
+services:
+  upstream:
+    image: nginx:1.29-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/certs:ro
+    networks:
+      default:
+        aliases: [upstream.test]
+
+  # The workload: ./client (built on the host by run.sh into ./bin/preconnect)
+  # opens a connection ahead of time and sends its request after idling; curl
+  # for the plain cases. Each trusts only what the case passes with -cacert.
+  client:
+    image: curlimages/curl:8.17.0
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ./bin/preconnect:/usr/local/bin/preconnect:ro
+      - ./certs:/certs:ro
+    depends_on: [upstream]
+
+  # Shares the client's network namespace, the way the extension runs the proxy
+  # in the target's netns. Started per case by run.sh, or as a shell by
+  # `./run.sh shell`; never by `up`.
+  proxy:
+    build: .
+    profiles: [proxy]
+    network_mode: service:client
+    cap_add: [NET_ADMIN]
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./bin/transparent-proxy:/lab/transparent-proxy:ro
+      - ./certs:/lab/certs:ro
