@@ -12,7 +12,7 @@ target application needs **no reconfiguration**.
 > self-loop protection, persistent connection-pool flush), **preflight mesh
 > detection**, **silent-no-op metrics**, a **fail-open supervisor** that
 > guarantees rule teardown on every exit path, and **L7 HTTP faults** (Host-header
-> selection, status-code injection, byte-identical pass-through). The capture
+> selection, status-code injection, per-request faults). The capture
 > path, connection-pool flush, L7 injection, and fail-open teardown are all
 > verified end to end under real iptables (see the `integration`-tagged tests),
 > and it is wired into a Steadybit host action (extension-host) that bundles this
@@ -68,9 +68,9 @@ The hostname/SNI targeting is what makes **one** tool work for both internal
   [How probability applies](#how-probability-applies)).
 - **Interception path (opt-in):** only when a CA is supplied via
   `--tls-ca-cert`/`--tls-ca-key` *and* a matching rule carries `httpStatus`, or
-  `latency` with `hosts`, an HTTPS connection is terminated and handled request
-  by request: faulted requests get a synthesized response or are delayed, the
-  others are forwarded. See
+  `latency` or `abort` with `hosts`, an HTTPS connection is terminated and
+  handled request by request: faulted requests get a synthesized response, are
+  delayed or are reset, the others are forwarded. See
   [HTTPS response injection](#https-response-injection). Without a CA the proxy
   never decrypts anything.
 
@@ -109,7 +109,8 @@ selectors match — an empty selector means "any".
 ```
 
 - `cidrs` — match the original destination IP (internal targeting).
-- `hosts` — match the TLS SNI, exact or subdomain (external targeting).
+- `hosts` — match the TLS SNI or HTTP `Host`, exact or subdomain (external
+  targeting).
 - `latency` — Go duration string, added before the upstream connect (for a
   rule with `hosts`, on cleartext HTTP and HTTPS through the interception CA:
   before each affected request is forwarded).
